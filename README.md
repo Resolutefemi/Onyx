@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="assets/brand/onyx-logo.svg" width="150" alt="Onyx Engine logo"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/onyx-logo-lockup-dark.svg">
+  <img src="assets/brand/onyx-logo-lockup.svg" width="520" alt="Onyx Engine logo"/>
+</picture>
 
 # ONYX ENGINE
 
