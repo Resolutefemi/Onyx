@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "onyx"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "onyx-core",
  "onyx-ecs",
@@ -15,20 +15,23 @@ dependencies = [
 
 [[package]]
 name = "onyx-core"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "onyx-ecs"
-version = "0.1.0"
+version = "0.2.0"
+dependencies = [
+ "onyx-core",
+]
 
 [[package]]
 name = "onyx-mcp"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "onyx-render"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "onyx-script"
-version = "0.1.0"
+version = "0.2.0"

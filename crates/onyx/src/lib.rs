@@ -1,8 +1,12 @@
 //! # onyx
 //!
-//! Umbrella crate for the Onyx Engine: it pulls in every subsystem crate and
-//! ships the `onyx` CLI (`info`, `--version`). Subsystems stay independently
-//! usable — see `docs/ARCHITECTURE.md` for the dependency rules.
+//! Umbrella crate for the Onyx Engine: it pulls in every subsystem crate,
+//! ships the `onyx` CLI (`info`, `sim`, `--version`) and provides the
+//! [`run_sim`] benchmark demo. Subsystems stay independently usable — see
+//! `docs/ARCHITECTURE.md` for the dependency rules.
+
+use onyx_core::FIXED_TIMESTEP_SECS;
+use onyx_ecs::{system, Schedule, Stage, SystemAccess, World};
 
 pub const ENGINE_NAME: &str = "Onyx Engine";
 
@@ -14,11 +18,11 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CRATES: &[(&str, &str)] = &[
     (
         "onyx-core",
-        "app loop, time, unified reversible command bus (PRD S1)",
+        "app loop, time, reversible command bus with transactions (PRD S1)",
     ),
     (
         "onyx-ecs",
-        "archetype ECS seed: entities, components, schedules (PRD S1)",
+        "archetype SoA ECS: world, queries, change detection, schedule (PRD S1)",
     ),
     (
         "onyx-render",
@@ -36,6 +40,95 @@ pub use onyx_ecs;
 pub use onyx_mcp;
 pub use onyx_render;
 pub use onyx_script;
+
+/// Demo simulation component: a body's position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Demo simulation component: a body's velocity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SimVelocity {
+    pub vx: f32,
+    pub vy: f32,
+}
+
+/// Result of [`run_sim`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SimReport {
+    /// Bodies simulated.
+    pub entities: u64,
+    /// Frames requested.
+    pub frames: u64,
+    /// Fixed ticks actually simulated (== frames at dt = 1/60 s).
+    pub ticks: u64,
+    /// Wall-clock duration of the whole run in milliseconds.
+    pub elapsed_ms: f64,
+    /// Sum of all x positions after the run (deterministic checksum).
+    pub checksum: f64,
+}
+
+/// Run a fixed-timestep motion simulation: `entity_count` bodies integrating
+/// velocity into position every 1/60 s tick for `frames` frames.
+///
+/// Exercises the M1 ECS end-to-end — spawn, insert with archetype migration,
+/// schedule execution and `view2_mut` iteration — and reports a deterministic
+/// checksum so regressions surface as checksum changes.
+pub fn run_sim(entity_count: u32, frames: u64) -> SimReport {
+    let start = std::time::Instant::now();
+    let mut world = World::new();
+    world.register_component::<SimPosition>("sim_position");
+    world.register_component::<SimVelocity>("sim_velocity");
+
+    for i in 0..entity_count {
+        let entity = world.spawn();
+        world.insert(
+            entity,
+            SimPosition {
+                x: i as f32,
+                y: (i % 7) as f32,
+            },
+        );
+        world.insert(entity, SimVelocity { vx: 1.0, vy: 0.5 });
+    }
+
+    let dt = FIXED_TIMESTEP_SECS as f32;
+    let integrate = system(
+        "integrate_motion",
+        SystemAccess::new()
+            .write::<SimPosition>()
+            .read::<SimVelocity>(),
+        move |world: &mut World| {
+            for (_entity, position, velocity) in world.view2_mut::<SimPosition, SimVelocity>() {
+                position.x += velocity.vx * dt;
+                position.y += velocity.vy * dt;
+            }
+        },
+    );
+    let mut schedule = Schedule::standard();
+    schedule.add_system(Stage::Update, Box::new(integrate));
+
+    let mut ticks = 0u64;
+    for _ in 0..frames {
+        world.tick();
+        schedule.run(&mut world);
+        ticks += 1;
+    }
+
+    let checksum: f64 = world
+        .view::<SimPosition>()
+        .map(|(_entity, position)| position.x as f64)
+        .sum();
+    SimReport {
+        entities: u64::from(entity_count),
+        frames,
+        ticks,
+        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+        checksum,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -57,5 +150,24 @@ mod tests {
         let parts: Vec<&str> = ENGINE_VERSION.split('.').collect();
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|part| part.parse::<u64>().is_ok()));
+    }
+
+    #[test]
+    fn sim_is_deterministic() {
+        let first = run_sim(64, 10);
+        let second = run_sim(64, 10);
+        assert_eq!(first.ticks, 10);
+        assert_eq!(first.entities, 64);
+        assert_eq!(
+            first.checksum, second.checksum,
+            "same inputs, same checksum"
+        );
+    }
+
+    #[test]
+    fn sim_checksum_grows_with_simulation_length() {
+        let short = run_sim(16, 2);
+        let long = run_sim(16, 6);
+        assert!(long.checksum > short.checksum, "bodies only move +x");
     }
 }

@@ -1,20 +1,20 @@
-# Onyx Engine — Architecture (M0)
+# Onyx Engine — Architecture (M1, first increment)
 
-This document maps the M0 Cargo workspace onto the subsystem catalog in
-[`PRD.md`](PRD.md) and fixes the rules that M1+ builds on. The workspace is
-deliberately dependency-free at M0: every crate compiles with `cargo` alone, so
-CI is green from day one and heavy dependencies (`wgpu`, `wasmtime`, `rapier`,
-`rmcp`) are introduced exactly when their milestone starts.
+This document maps the Cargo workspace onto the subsystem catalog in
+[`PRD.md`](PRD.md) and fixes the rules that later milestones build on. The
+workspace is deliberately dependency-free: every crate compiles with `cargo`
+alone, so CI is green from day one and heavy dependencies (`wgpu`, `wasmtime`,
+`rapier`, `rmcp`) are introduced exactly when their milestone starts.
 
 ## Workspace layout
 
 ```text
 Onyx/
 ├── crates/
-│   ├── onyx/          umbrella crate + `onyx` CLI (info, --version)
+│   ├── onyx/          umbrella crate + `onyx` CLI (info, sim, --version)
 │   ├── onyx-core/     app loop, time, unified reversible command bus   (PRD §1)
-│   ├── onyx-ecs/      archetype ECS seed: entities, components,        (PRD §1)
-│   │                  archetype signatures, schedule stages
+│   ├── onyx-ecs/      archetype SoA ECS: world, queries, change        (PRD §1)
+│   │                  detection, schedule, fixed-timestep plugin
 │   ├── onyx-render/   wgpu HAL, render graph, PBR + 2D pipelines       (PRD §2–4)
 │   ├── onyx-mcp/      sub-5ms AI control plane, batched atomic RPC     (PRD §16)
 │   └── onyx-script/   polyglot WASM component runtime                  (PRD §13)
@@ -25,14 +25,14 @@ Onyx/
 
 ## Crate map
 
-| Crate | PRD scope | Owned milestone | M0 contents |
+| Crate | PRD scope | Owned milestone | Current contents |
 | --- | --- | --- | --- |
-| `onyx-core` | §1 Core Architecture | M0 → M1 | `App` runner + `Plugin` model, `Time` (variable delta + fixed-step accrual), `EngineCommand` / `CommandBus` shared undo-redo history |
-| `onyx-ecs` | §1 Core Architecture | M0 → M1 | `Entity` generational handles + `Entities` allocator, `Component` marker + `ComponentRegistry`, `ArchetypeSignature`, `Stage` / `Schedule` |
-| `onyx-render` | §2–4 Rendering | M0 → M2 | `Backend` enum (Vulkan/DX12/Metal/WebGPU), `RendererConfig`, `PipelineId` |
-| `onyx-mcp` | §16 AI Control Plane | M0 → M3 | `ToolSpec` + `ToolRegistry` (`tools/list` shape), `BatchCommand` / `BatchResult` (`batch_execute` semantics), batch validation |
-| `onyx-script` | §13 Polyglot Scripting | M0 → M6 | `ScriptLanguage` (11 targets), `ScriptRuntimeConfig` (hot-reload, fuel limit, instance cap) |
-| `onyx` | composition | M0 | re-exports of all subsystems, `ENGINE_NAME` / `ENGINE_VERSION`, `onyx` CLI with `info`, `--version`, exit-code contract |
+| `onyx-core` | §1 Core Architecture | M1 | `App` runner + `Plugin` model, `Time` (variable delta + fixed-step accrual), `EngineCommand` / `CommandBus` with transaction grouping, replay log and shared undo-redo |
+| `onyx-ecs` | §1 Core Architecture | M1 | `World`: dense SoA archetype storage with entity migration and row patching; `Entity` generational handles; `view`/`view2` (+ `_mut`) queries; change detection (`iter_changed`, `take_removed`); `Schedule` with access-declared `System`s and same-stage conflict rejection; `EcsPlugin` fixed-timestep driver |
+| `onyx-render` | §2–4 Rendering | M2 | `Backend` enum (Vulkan/DX12/Metal/WebGPU), `RendererConfig`, `PipelineId` |
+| `onyx-mcp` | §16 AI Control Plane | M3 | `ToolSpec` + `ToolRegistry` (`tools/list` shape), `BatchCommand` / `BatchResult` (`batch_execute` semantics), batch validation |
+| `onyx-script` | §13 Polyglot Scripting | M6 | `ScriptLanguage` (11 targets), `ScriptRuntimeConfig` (hot-reload, fuel limit, instance cap) |
+| `onyx` | composition | M0 → | re-exports of all subsystems, `ENGINE_NAME` / `ENGINE_VERSION`, `onyx` CLI (`info`, `sim` motion benchmark with deterministic checksum, `--version`) |
 
 ## Dependency direction
 
@@ -41,7 +41,7 @@ Onyx/
             │        depends on every subsystem           │
             ▼                                             ▼
   onyx-core ←── onyx-ecs        onyx-render   onyx-mcp   onyx-script
-  (base layer)  (may use core)   (may use      (uses     (may use
+  (base layer)  (uses core)     (may use      (uses     (may use
                                  core+ecs)     core)     core+ecs)
 ```
 
@@ -59,10 +59,10 @@ Rules:
 
 ## Milestone mapping
 
-| Milestone | What exists at M0 | What lands there |
+| Milestone | Status / what exists | What lands there |
 | --- | --- | --- |
-| **M0 — Scaffold** ✅ | This workspace, CI, brand, PRD | — |
-| **M1 — ECS Core** | `onyx-ecs` seed types | SoA archetype storage, sparse-set tags, lock-free parallel scheduler, change detection, `#[derive(OnyxReflect)]`, serialization |
+| **M0 — Scaffold** ✅ | Workspace, CI, brand, PRD | — |
+| **M1 — ECS Core** 🚧 | SoA archetype storage ✅, entity migration ✅, `view`/`view2` queries ✅, change detection ✅, access-declared scheduler with conflict rejection ✅, command-bus transactions + replay ✅ | Remaining: sparse-set tags for high-churn components, lock-free parallel dispatch of independent systems, `#[derive(OnyxReflect)]` reflection, serialization |
 | **M2 — Renderer** | `onyx-render` config surface | wgpu HAL, forward PBR, 2D suite, post-processing stack |
 | **M3 — MCP Control Plane** | `onyx-mcp` registry + batch shapes | `rmcp` JSON-RPC server, atomic `batch_execute` <5 ms, headless sim, undo/redo bridge to `onyx-core` |
 | **M4 — Physics & Animation** | crate TBD (`onyx-physics`) | Rapier 2D/3D integration, character controller, skeletal animation & blending |

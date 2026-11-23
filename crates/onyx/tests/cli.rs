@@ -27,6 +27,31 @@ fn cli_info_lists_workspace_crates() {
 }
 
 #[test]
+fn cli_sim_runs_and_reports() {
+    let output = Command::new(env!("CARGO_BIN_EXE_onyx"))
+        .args(["sim", "--entities", "50", "--frames", "10"])
+        .output()
+        .expect("failed to run onyx sim");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("50 entities x 10 frames"),
+        "unexpected: {stdout}"
+    );
+    assert!(stdout.contains("ticks"), "unexpected: {stdout}");
+    assert!(stdout.contains("checksum"), "unexpected: {stdout}");
+}
+
+#[test]
+fn cli_sim_rejects_unknown_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_onyx"))
+        .args(["sim", "--bogus"])
+        .output()
+        .expect("failed to run onyx sim");
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
 fn cli_rejects_unknown_commands() {
     let output = Command::new(env!("CARGO_BIN_EXE_onyx"))
         .arg("definitely-not-a-command")
