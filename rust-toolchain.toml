@@ -1,0 +1,5 @@
+# Onyx Engine pins the stable channel; CI and contributors resolve the same
+# minor line. Bump deliberately, one minor at a time.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

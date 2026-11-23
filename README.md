@@ -23,7 +23,7 @@ Sub-5ms Agentic MCP Control · Bevy-class ECS · wgpu Renderer · WASM Component
 
 Onyx Engine is an open-source, pure-Rust 2D/3D game engine engineered to challenge AAA engines like Unreal Engine in visual capability and raw performance, while surpassing Bevy and Godot in developer velocity, polyglot scripting, and AI-native automation. Onyx exposes its entire simulation loop, asset pipeline, and ECS scene hierarchy via a zero-latency MCP (Model Context Protocol) server — allowing AI agents to execute batch mutations and playtest scenes in under 5 milliseconds.
 
-> **Status: pre-alpha, design phase.** The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md). Implementation starts with the ECS core and MCP control plane (see the [roadmap](#roadmap)).
+> **Status: pre-alpha — M0 scaffold complete.** The Cargo workspace, crate layout and CI are live (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)); the archetype ECS core (M1) is up next. The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md) (see the [roadmap](#roadmap)).
 
 ## Why Onyx?
 
@@ -115,8 +115,8 @@ Key properties:
 
 | Milestone | Scope |
 | --- | --- |
-| **M0 — Scaffold** | Cargo workspace, CI, brand, PRD sign-off *(current)* |
-| **M1 — ECS Core** | Archetype ECS, scheduler, command bus, reflection & serialization |
+| **M0 — Scaffold** | Cargo workspace, CI, brand, PRD sign-off ✅ *(complete)* |
+| **M1 — ECS Core** | Archetype ECS, scheduler, command bus, reflection & serialization *(next)* |
 | **M2 — Renderer** | wgpu HAL, forward PBR, 2D suite, post-processing |
 | **M3 — MCP Control Plane** | `rmcp` JSON-RPC server, `batch_execute`, headless sim, undo/redo bridge |
 | **M4 — Physics & Animation** | Rapier integration, character controller, skeletal animation & blending |
@@ -125,7 +125,7 @@ Key properties:
 
 ## Contributing
 
-The engine is in its design phase — the most valuable contributions right now are feedback on [`docs/PRD.md`](docs/PRD.md), reference implementations of isolated subsystems (see the [architecture templates](#architecture-reference-templates)), and MCP tool-schema review from AI-tooling developers.
+The engine is in early implementation (M0 complete) — the most valuable contributions right now are feedback on [`docs/PRD.md`](docs/PRD.md), reference implementations of isolated subsystems (see the [architecture templates](#architecture-reference-templates)), and MCP tool-schema review from AI-tooling developers. For build instructions and the workspace layout, see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## License
 

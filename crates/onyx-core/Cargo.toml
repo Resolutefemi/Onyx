@@ -1,0 +1,11 @@
+[package]
+name = "onyx-core"
+description = "Onyx Engine core runtime: app loop, time model, and the unified reversible command bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "onyx-mcp"
+description = "Onyx Engine Sub-5ms MCP AI Control Plane: self-describing tool registry and batched atomic RPC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

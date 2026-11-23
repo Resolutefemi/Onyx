@@ -1,0 +1,11 @@
+[package]
+name = "onyx-script"
+description = "Onyx Engine polyglot scripting: sandboxed WASM components in Rust, Python, TS, Go, C#, Zig, Lua, Swift"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

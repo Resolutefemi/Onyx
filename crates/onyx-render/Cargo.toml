@@ -1,0 +1,11 @@
+[package]
+name = "onyx-render"
+description = "Onyx Engine rendering: wgpu HAL, render graph, PBR and 2D pipelines (M0: config types)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]

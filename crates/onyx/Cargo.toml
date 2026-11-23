@@ -1,0 +1,20 @@
+[package]
+name = "onyx"
+description = "Onyx Engine umbrella crate: subsystem composition and the onyx CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+onyx-core.workspace = true
+onyx-ecs.workspace = true
+onyx-mcp.workspace = true
+onyx-render.workspace = true
+onyx-script.workspace = true
+
+[[bin]]
+name = "onyx"
+path = "src/main.rs"

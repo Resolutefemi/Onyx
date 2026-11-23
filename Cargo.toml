@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+repository = "https://github.com/Resolutefemi/Onyx"
+authors = ["Resolute Femi <ariyooluwafemi487@gmail.com>"]
+
+[workspace.dependencies]
+onyx-core = { path = "crates/onyx-core", version = "0.1.0" }
+onyx-ecs = { path = "crates/onyx-ecs", version = "0.1.0" }
+onyx-mcp = { path = "crates/onyx-mcp", version = "0.1.0" }
+onyx-render = { path = "crates/onyx-render", version = "0.1.0" }
+onyx-script = { path = "crates/onyx-script", version = "0.1.0" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
