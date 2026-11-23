@@ -69,7 +69,9 @@ impl Entities {
     #[must_use]
     pub fn is_alive(&self, entity: Entity) -> bool {
         match self.generations.get(entity.index as usize) {
-            Some(&generation) => generation == entity.generation && entity.generation % 2 == 0,
+            Some(&generation) => {
+                generation == entity.generation && entity.generation.is_multiple_of(2)
+            }
             None => false,
         }
     }
