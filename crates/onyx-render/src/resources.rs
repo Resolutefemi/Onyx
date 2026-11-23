@@ -634,7 +634,18 @@ mod tests {
                         linear_to_srgb8(srgb8_to_linear(texel[2]) * 0.25),
                         texel[3],
                     ];
-                    assert_eq!(pixel, &expected, "tint applies in linear space");
+                    // The ×1.0 channel and alpha are bit-exact (the sRGB
+                    // round-trip test proves the transfer function); tinted
+                    // channels allow ±1 LSB because the GPU encodes in f32
+                    // while this reference model uses f64 — boundary values
+                    // can flip the final rounding.
+                    for k in 0..4 {
+                        let tolerance = if k == 1 || k == 2 { 1 } else { 0 };
+                        assert!(
+                            (i32::from(pixel[k]) - i32::from(expected[k])).abs() <= tolerance,
+                            "tint applies in linear space: pixel {pixel:?} vs {expected:?}"
+                        );
+                    }
                 }
             }
             Err(RenderError::NoAdapter { .. }) => {}
