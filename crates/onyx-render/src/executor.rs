@@ -813,9 +813,10 @@ mod tests {
                     .map(|&name| ResourceSpec::new(name, 8, 8))
                     .collect();
                 let kinds = |name: &str| {
-                    STRESS_TARGETS
+                    // kind_of receives NODE names; node n_i writes target t_i.
+                    STRESS_NODES
                         .iter()
-                        .position(|target| *target == name)
+                        .position(|node_name| *node_name == name)
                         .map(|index| {
                             let channel = 0.125 * index as f64 + 0.05;
                             PassKind::Clear([channel, 1.0 - channel, channel * 0.5, 1.0])
