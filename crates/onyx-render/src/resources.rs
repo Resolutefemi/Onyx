@@ -612,7 +612,14 @@ mod tests {
                 // values would make the assertion driver-dependent).
                 let channel = |i: u32| (((i * 11 + 29) % 243) + 6) as u8;
                 let texels: Vec<u8> = (0u32..8 * 8)
-                    .flat_map(|i| [channel(i * 3), channel(i * 3 + 1), channel(i * 3 + 2), 255u8])
+                    .flat_map(|i| {
+                        [
+                            channel(i * 3),
+                            channel(i * 3 + 1),
+                            channel(i * 3 + 2),
+                            255u8,
+                        ]
+                    })
                     .collect();
                 let uniform = QuadUniform {
                     tint: [1.0, 0.5, 0.25, 1.0],
