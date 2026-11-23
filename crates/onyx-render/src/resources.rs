@@ -607,8 +607,12 @@ mod tests {
     fn quad_tint_multiplies_in_linear_space() {
         match Renderer::try_new(&RendererConfig::default()) {
             Ok(renderer) => {
-                let texels: Vec<u8> = (0u32..8 * 8 * 4)
-                    .map(|i| (((i * 11 + 29) % 243) + 6) as u8)
+                // Alpha pinned to 255: with tint alpha 1.0 the sampled alpha
+                // passes through unchanged on every backend (varying alpha
+                // values would make the assertion driver-dependent).
+                let channel = |i: u32| (((i * 11 + 29) % 243) + 6) as u8;
+                let texels: Vec<u8> = (0u32..8 * 8)
+                    .flat_map(|i| [channel(i * 3), channel(i * 3 + 1), channel(i * 3 + 2), 255u8])
                     .collect();
                 let uniform = QuadUniform {
                     tint: [1.0, 0.5, 0.25, 1.0],
@@ -621,7 +625,7 @@ mod tests {
                         linear_to_srgb8(srgb8_to_linear(texel[0])),
                         linear_to_srgb8(srgb8_to_linear(texel[1]) * 0.5),
                         linear_to_srgb8(srgb8_to_linear(texel[2]) * 0.25),
-                        255,
+                        texel[3],
                     ];
                     assert_eq!(pixel, &expected, "tint applies in linear space");
                 }
@@ -787,14 +791,13 @@ mod tests {
                     ],
                     "far outside must stay exactly the background"
                 );
-                // The apex pixel (inside the triangle) is also exact.
-                let apex_x = 32usize;
-                let apex_y = 6usize; // 0.6 NDC ≈ row 6 for a 64px target
-                let apex = (apex_y * 64 + apex_x) * 4;
+                // A second deep-interior point (NDC ≈ (0.016, −0.266), well
+                // clear of every edge): MSAA only affects edge pixels.
+                let interior2 = (40 * 64 + 32) * 4;
                 assert_eq!(
-                    &frame.pixels[apex..apex + 4],
+                    &frame.pixels[interior2..interior2 + 4],
                     &[255, 255, 255, 255],
-                    "apex pixel must be resolved to the triangle color"
+                    "deep interior point must resolve to the triangle color"
                 );
             }
             Err(RenderError::NoAdapter { .. }) => {}
