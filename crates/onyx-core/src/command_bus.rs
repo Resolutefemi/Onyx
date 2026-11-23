@@ -125,7 +125,9 @@ impl CommandBus {
             return false;
         };
         let mut ok = true;
-        while let Some(mut command) = group.pop() {
+        // Revert in reverse order but KEEP the commands: `redo` re-applies
+        // the same objects.
+        for command in group.iter_mut().rev() {
             ok &= command.revert();
         }
         if ok {
@@ -177,11 +179,56 @@ impl CommandBus {
             .map(|command| command.name())
             .collect()
     }
+
+    /// Mark the current history position for a later [`CommandBus::restore`]
+    /// (PRD §1, "branching history snapshots").
+    #[must_use]
+    pub fn snapshot(&self) -> HistoryMark {
+        HistoryMark {
+            depth: self.applied.len(),
+        }
+    }
+
+    /// Rewind the history to `mark`: every unit applied after the mark is
+    /// undone in reverse order; when units are actually rewound, the redo
+    /// branch is discarded — a new branch starts from the restored state.
+    /// Restoring to a mark deeper than the current history (after manual
+    /// undos) is a no-op.
+    ///
+    /// Returns the number of units reverted.
+    pub fn restore(&mut self, mark: HistoryMark) -> usize {
+        let mut reverted = 0;
+        while self.applied.len() > mark.depth {
+            let Some(mut group) = self.applied.pop() else {
+                break;
+            };
+            let mut ok = true;
+            for command in group.iter_mut().rev() {
+                ok &= command.revert();
+            }
+            if !ok {
+                break; // mirror `undo`: a failed revert discards the unit
+            }
+            reverted += 1;
+        }
+        if reverted > 0 {
+            self.undone.clear();
+        }
+        reverted
+    }
+}
+
+/// A recorded position in the undo history; take one with
+/// [`CommandBus::snapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryMark {
+    depth: usize,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct SetValue {
@@ -282,5 +329,84 @@ mod tests {
         let mut bus = CommandBus::new();
         bus.begin_transaction();
         bus.begin_transaction();
+    }
+
+    #[derive(Debug, Clone)]
+    struct Log {
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        item: &'static str,
+    }
+
+    impl Log {
+        fn new(trace: &Arc<Mutex<Vec<&'static str>>>, item: &'static str) -> Self {
+            Self {
+                trace: Arc::clone(trace),
+                item,
+            }
+        }
+    }
+
+    impl EngineCommand for Log {
+        fn name(&self) -> &'static str {
+            "log"
+        }
+        fn apply(&mut self) -> bool {
+            self.trace.lock().expect("trace").push(self.item);
+            true
+        }
+        fn revert(&mut self) -> bool {
+            self.trace.lock().expect("trace").pop();
+            true
+        }
+    }
+
+    #[test]
+    fn restore_rewinds_to_mark_and_discards_redo() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = CommandBus::new();
+        for item in ["a", "b"] {
+            bus.execute(Box::new(Log::new(&trace, item)));
+        }
+        let mark = bus.snapshot();
+        for item in ["c", "d", "e"] {
+            bus.execute(Box::new(Log::new(&trace, item)));
+        }
+        assert_eq!(bus.undo_depth(), 5);
+        assert_eq!(*trace.lock().expect("trace"), vec!["a", "b", "c", "d", "e"]);
+
+        assert_eq!(bus.restore(mark), 3, "three units rewound");
+        assert_eq!(bus.undo_depth(), 2);
+        assert_eq!(bus.redo_depth(), 0, "restore starts a fresh branch");
+        assert_eq!(*trace.lock().expect("trace"), vec!["a", "b"]);
+        assert_eq!(bus.replay_log(), vec!["log", "log"]);
+    }
+
+    #[test]
+    fn restore_past_the_current_history_is_a_noop() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = CommandBus::new();
+        bus.execute(Box::new(Log::new(&trace, "a")));
+        let mark = bus.snapshot();
+        bus.execute(Box::new(Log::new(&trace, "b")));
+        assert!(bus.undo(), "manual undo below the mark");
+        assert_eq!(bus.restore(mark), 0, "cannot restore forward");
+        assert_eq!(bus.undo_depth(), 1, "'a' stays applied");
+        assert_eq!(*trace.lock().expect("trace"), vec!["a"]);
+    }
+
+    #[test]
+    fn restore_midway_keeps_earlier_units_replayable() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut bus = CommandBus::new();
+        bus.execute(Box::new(Log::new(&trace, "a")));
+        let midway = bus.snapshot();
+        bus.execute(Box::new(Log::new(&trace, "b")));
+        bus.execute(Box::new(Log::new(&trace, "c")));
+        assert_eq!(bus.restore(midway), 2);
+        // The earlier history still undoes/redoes normally.
+        assert!(bus.undo());
+        assert_eq!(bus.undo_depth(), 0);
+        assert!(bus.redo());
+        assert_eq!(*trace.lock().expect("trace"), vec!["a"]);
     }
 }

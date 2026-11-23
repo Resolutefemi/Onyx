@@ -13,6 +13,12 @@
 
 pub use onyx_reflect_macro::OnyxReflect;
 
+/// JSON document model: nested objects/arrays for scenes, saves and assets.
+pub mod json;
+
+/// Compact tagged binary serialization for [`FieldValue`].
+pub mod binary;
+
 /// Lets the derive-generated `onyx_reflect::…` paths resolve inside this
 /// crate itself (the unit tests use the derive).
 extern crate self as onyx_reflect;
@@ -206,6 +212,8 @@ pub enum ReflectError {
         /// Declared leaf type name.
         expected: &'static str,
     },
+    /// Binary input is truncated, tagged wrongly, or otherwise malformed.
+    InvalidBinary(String),
 }
 
 impl fmt::Display for ReflectError {
@@ -217,6 +225,7 @@ impl fmt::Display for ReflectError {
             Self::TypeMismatch { field, expected } => {
                 write!(f, "field '{field}' does not parse as {expected}")
             }
+            Self::InvalidBinary(detail) => write!(f, "invalid binary: {detail}"),
         }
     }
 }

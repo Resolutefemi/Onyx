@@ -19,7 +19,7 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CRATES: &[(&str, &str)] = &[
     (
         "onyx-core",
-        "app loop, time, reversible command bus with transactions (PRD S1)",
+        "app loop, time, command bus + snapshots, allocators, job pool, scene & prefab (PRD S1)",
     ),
     (
         "onyx-ecs",
@@ -27,7 +27,7 @@ pub const CRATES: &[(&str, &str)] = &[
     ),
     (
         "onyx-reflect",
-        "reflection, JSON serialization, type registry (PRD S1)",
+        "reflection, JSON + binary serialization, JSON DOM, type registry (PRD S1)",
     ),
     (
         "onyx-render",
