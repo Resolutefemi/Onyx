@@ -4,14 +4,25 @@
 //! Graphics Pipeline), §3 (Lighting, Shadows & Atmosphere) and §4 (Materials,
 //! Shaders & Post-Processing).
 //!
-//! M0 defines the public configuration surface: the backend enum and renderer
-//! config used by `onyx-core`'s app wiring and by `onyx info`. M2 lands the
-//! real implementation:
+//! M2 (first increment) lands the hardware foundation:
 //!
-//! - `wgpu` cross-platform HAL (Vulkan, DirectX 12, Metal, WebGPU) plus the
-//!   raw `ash` Vulkan fast-path,
-//! - DAG-based parallel render graph,
-//! - forward PBR first, then the 2D suite and the post-processing stack.
+//! - [`renderer::Renderer`] — `wgpu` instance/adapter/device/queue setup with
+//!   graceful degradation: GPU-less (headless) machines get
+//!   [`renderer::RenderError::NoAdapter`], never a panic,
+//! - [`graph::RenderGraph`] — named nodes with explicit dependencies,
+//!   Kahn topological execution order, cycle detection (resource-based
+//!   automatic barrier insertion lands with the real passes),
+//! - [`offscreen::render_offscreen`] — clear-pass rendering into an offscreen
+//!   RGBA8 sRGB texture with GPU readback, validating the whole device →
+//!   encoder → submit → map pipeline without needing a window.
+//!
+//! Still ahead in M2: surfaces and present, the DAG-driven parallel graph
+//! execution with automatic barriers, forward PBR, the 2D suite and the
+//! post-processing stack.
+
+pub mod graph;
+pub mod offscreen;
+pub mod renderer;
 
 /// Physical graphics backend targeted by the hardware abstraction layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,9 +83,13 @@ impl Default for RendererConfig {
     }
 }
 
-/// Handle to a pipeline registered with the (M2) render graph.
+/// Handle to a pipeline registered with the render graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineId(pub u32);
+
+pub use graph::{GraphError, RenderGraph, RenderGraphNode};
+pub use offscreen::{render_offscreen, OffscreenFrame};
+pub use renderer::{RenderError, Renderer};
 
 #[cfg(test)]
 mod tests {

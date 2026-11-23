@@ -57,6 +57,26 @@ fn cli_sim_rejects_unknown_flags() {
 }
 
 #[test]
+fn cli_render_reports_adapter_or_graceful_unavailable() {
+    let output = Command::new(env!("CARGO_BIN_EXE_onyx"))
+        .arg("render")
+        .output()
+        .expect("failed to run onyx render");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("render probe"), "unexpected: {stdout}");
+    assert!(
+        stdout.contains("adapter"),
+        "adapter line missing from render output: {stdout}"
+    );
+    // Either a real adapter + graph checksums, or the graceful headless path:
+    assert!(
+        stdout.contains("checksum") || stdout.contains("skipped"),
+        "unexpected render output: {stdout}"
+    );
+}
+
+#[test]
 fn cli_rejects_unknown_commands() {
     let output = Command::new(env!("CARGO_BIN_EXE_onyx"))
         .arg("definitely-not-a-command")

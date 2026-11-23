@@ -31,7 +31,7 @@ pub const CRATES: &[(&str, &str)] = &[
     ),
     (
         "onyx-render",
-        "wgpu HAL, render graph, PBR + 2D pipelines (PRD S2-S4)",
+        "wgpu HAL, render graph, offscreen validation (PRD S2-S4; M2 in progress)",
     ),
     (
         "onyx-mcp",
@@ -45,6 +45,10 @@ pub use onyx_ecs;
 pub use onyx_mcp;
 pub use onyx_reflect;
 pub use onyx_render;
+pub use onyx_render::{
+    render_offscreen, GraphError, OffscreenFrame, RenderError, RenderGraph, RenderGraphNode,
+    Renderer, RendererConfig,
+};
 pub use onyx_script;
 
 /// Demo simulation component: a body's position.
