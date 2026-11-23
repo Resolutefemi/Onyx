@@ -20,8 +20,9 @@ Onyx/
 │   │                  detection, parallel-batch schedule, plugin
 │   ├── onyx-reflect/  reflection: schemas, JSON, type registry         (PRD §1)
 │   ├── onyx-reflect-macro/  #[derive(OnyxReflect)] (no-dep proc macro)
-│   ├── onyx-render/   wgpu 30 HAL init, DAG render graph, offscreen    (PRD §2–4)
-│   │                  clear-pass readback; PBR + 2D pipelines in M2
+│   ├── onyx-render/   wgpu 30 HAL, resource-driven DAG graph, WGSL     (PRD §2–4)
+│   │                  triangle pipeline, offscreen graph executor;
+│   │                  PBR + 2D pipelines in M2
 │   ├── onyx-mcp/      sub-5ms AI control plane, batched atomic RPC     (PRD §16)
 │   └── onyx-script/   polyglot WASM component runtime                  (PRD §13)
 ├── docs/              PRD and this document
@@ -37,7 +38,7 @@ Onyx/
 | `onyx-ecs` | §1 Core Architecture | M1 | `World`: dense SoA archetype storage with entity migration and row patching; `Entity` generational handles; `view`/`view2` (+ `_mut`) queries; change detection (`iter_changed`, `take_removed`); `Schedule` with access-declared `System`s, same-stage conflict rejection and parallel read-only batches (`reader_system` + scoped threads); `EcsPlugin` fixed-timestep driver |
 | `onyx-reflect` | §1 Core Architecture | M1 | `Reflect` trait + `#[derive(OnyxReflect)]` (via `onyx-reflect-macro`), `FieldValue` / `Schema`, `to_json` / `from_json` (flat scalar objects), `TypeRegistry` with `schemas_json` export seeding MCP tool schemas |
 | `onyx-reflect-macro` | §1 Core Architecture | M1 | Hand-rolled derive on the built-in `proc_macro` crate — no `syn`/`quote` — for non-generic structs with named scalar fields (`f32`, `f64`, `u32`, `u64`, `i32`, `i64`, `bool`, `String`) |
-| `onyx-render` | §2–4 Rendering | M2 | `Renderer::try_new` — wgpu 30 instance/adapter/device/queue with backend filtering and graceful `RenderError::NoAdapter` on GPU-less machines; `RenderGraph` — named nodes, explicit deps, Kahn topological order with cycle detection; `render_offscreen` — clear pass into an RGBA8 sRGB texture with 256-byte-aligned readback and sRGB-verified pixels; `Backend` enum, `RendererConfig`, `PipelineId` |
+| `onyx-render` | §2–4 Rendering | M2 | `Renderer::try_new` — wgpu 30 instance/adapter/device/queue with backend filtering and graceful `RenderError::NoAdapter` on GPU-less machines; `RenderGraph` — nodes declare resource reads/writes, edges inferred (producer→consumer, conflicting writers by declaration order), Kahn topological order + cycle detection; `pipeline` — inlined WGSL triangle shader, `Vertex` layout + explicit byte packing, `create_triangle_pipeline`; `executor::execute_offscreen` — one encoder, passes in graph order, single submission, per-target readback; `render_offscreen` clear pass with sRGB-verified readback; `Backend` enum, `RendererConfig`, `PipelineId` |
 | `onyx-mcp` | §16 AI Control Plane | M3 | `ToolSpec` + `ToolRegistry` (`tools/list` shape), `BatchCommand` / `BatchResult` (`batch_execute` semantics), batch validation |
 | `onyx-script` | §13 Polyglot Scripting | M6 | `ScriptLanguage` (11 targets), `ScriptRuntimeConfig` (hot-reload, fuel limit, instance cap) |
 | `onyx` | composition | M0 → | re-exports of all subsystems, `ENGINE_NAME` / `ENGINE_VERSION`, `onyx` CLI (`info`, `sim` motion benchmark with reflected JSON sample, `render` GPU probe with offscreen graph checksums, `--version`) |
@@ -73,7 +74,7 @@ Rules:
 | --- | --- | --- |
 | **M0 — Scaffold** ✅ | Workspace, CI, brand, PRD | — |
 | **M1 — ECS Core** ✅ | SoA archetype storage ✅, entity migration ✅, `view`/`view2` queries ✅, change detection ✅, scheduler with conflict rejection + parallel read-only batches ✅, command-bus transactions + replay ✅, `#[derive(OnyxReflect)]` + JSON serialization + type registry ✅ | Deferred by decision: sparse-set side tables (unit-struct components already tag entities via archetypes) |
-| **M2 — Renderer** 🚧 | wgpu 30 adapter/device init + graceful `NoAdapter` ✅, DAG render graph with cycle detection ✅, offscreen clear-pass readback validation ✅ | Remaining: surfaces & present, parallel graph execution with automatic barriers, forward PBR, 2D suite, post-processing stack |
+| **M2 — Renderer** 🚧 | wgpu 30 adapter/device init + graceful `NoAdapter` ✅, resource-driven DAG graph (inferred write→read edges, conflict ordering, cycle detection) ✅, WGSL triangle pipeline + sRGB pixel contract ✅, single-submission graph executor with per-target readback ✅ | Remaining: surfaces & present, bind groups & resource sampling, parallel multi-encoder execution, forward PBR, 2D suite, post-processing stack |
 | **M3 — MCP Control Plane** | `onyx-mcp` registry + batch shapes | `rmcp` JSON-RPC server, atomic `batch_execute` <5 ms, headless sim, undo/redo bridge to `onyx-core` |
 | **M4 — Physics & Animation** | crate TBD (`onyx-physics`) | Rapier 2D/3D integration, character controller, skeletal animation & blending |
 | **M5 — Editor** | crate TBD (`onyx-editor`) | Visual editor, inspector, gizmos, prefab system |

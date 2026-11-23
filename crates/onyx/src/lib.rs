@@ -31,7 +31,7 @@ pub const CRATES: &[(&str, &str)] = &[
     ),
     (
         "onyx-render",
-        "wgpu HAL, render graph, offscreen validation (PRD S2-S4; M2 in progress)",
+        "wgpu HAL, resource-driven DAG graph, WGSL pipeline + offscreen executor (PRD S2-S4; M2 in progress)",
     ),
     (
         "onyx-mcp",
@@ -46,8 +46,8 @@ pub use onyx_mcp;
 pub use onyx_reflect;
 pub use onyx_render;
 pub use onyx_render::{
-    render_offscreen, GraphError, OffscreenFrame, RenderError, RenderGraph, RenderGraphNode,
-    Renderer, RendererConfig,
+    execute_offscreen, render_offscreen, GraphError, OffscreenFrame, PassKind, RenderError,
+    RenderGraph, RenderGraphNode, Renderer, RendererConfig, ResourceSpec,
 };
 pub use onyx_script;
 

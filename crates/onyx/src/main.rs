@@ -1,8 +1,8 @@
 //! `onyx` — the Onyx Engine CLI.
 
 use onyx::{
-    render_offscreen, RenderGraph, RenderGraphNode, Renderer, RendererConfig, CRATES, ENGINE_NAME,
-    ENGINE_VERSION,
+    execute_offscreen, PassKind, RenderGraph, RenderGraphNode, Renderer, RendererConfig,
+    ResourceSpec, CRATES, ENGINE_NAME, ENGINE_VERSION,
 };
 
 fn main() {
@@ -84,37 +84,58 @@ fn run_render_command() {
             println!("  backend    {:?}", info.backend);
 
             let mut graph = RenderGraph::new();
-            let declarations: [(&str, &[&str]); 4] = [
-                ("red", &[]),
-                ("green", &[]),
-                ("blue", &[]),
-                ("composite", &["red", "green", "blue"]),
-            ];
-            for (name, after) in declarations {
-                graph
-                    .try_add_node(RenderGraphNode {
-                        name,
-                        after: after.to_vec(),
-                    })
-                    .expect("demo nodes are unique and declared in order");
+            for node in [
+                RenderGraphNode {
+                    name: "triangle",
+                    reads: &[],
+                    writes: &["scene"],
+                },
+                RenderGraphNode {
+                    name: "clear",
+                    reads: &[],
+                    writes: &["post"],
+                },
+            ] {
+                graph.try_add_node(node).expect("demo nodes are unique");
             }
             let order = graph.execution_order().expect("demo graph is acyclic");
-            println!("  graph      {} nodes → {order:?}", graph.node_count());
+            println!(
+                "  graph      {} nodes → {order:?} (2 targets)",
+                graph.node_count()
+            );
 
-            let colors: [(&str, [f64; 4]); 4] = [
-                ("red", [0.8, 0.1, 0.1, 1.0]),
-                ("green", [0.1, 0.8, 0.2, 1.0]),
-                ("blue", [0.15, 0.25, 0.85, 1.0]),
-                ("composite", [0.5, 0.5, 0.5, 1.0]),
+            let resources = [
+                ResourceSpec {
+                    name: "scene",
+                    width: 64,
+                    height: 64,
+                },
+                ResourceSpec {
+                    name: "post",
+                    width: 64,
+                    height: 64,
+                },
             ];
-            for (name, color) in colors {
-                match render_offscreen(&renderer, 64, 64, color) {
-                    Ok(frame) => println!(
-                        "  node {name:<10} 64x64 clear checksum {:016x}",
-                        frame.checksum()
-                    ),
-                    Err(error) => println!("  node {name:<10} render failed: {error}"),
+            let kinds = |name: &str| match name {
+                "triangle" => Some(PassKind::Triangle {
+                    triangle: [1.0, 0.35, 0.15, 1.0],
+                    background: [0.05, 0.05, 0.1, 1.0],
+                }),
+                "clear" => Some(PassKind::Clear([0.1, 0.1, 0.35, 1.0])),
+                _ => None,
+            };
+            match execute_offscreen(&renderer, &graph, &resources, &kinds) {
+                Ok(frames) => {
+                    for (name, frame) in frames {
+                        println!(
+                            "  target {name:<10} {}x{} checksum {:016x}",
+                            frame.width,
+                            frame.height,
+                            frame.checksum()
+                        );
+                    }
                 }
+                Err(error) => println!("  execute    failed: {error}"),
             }
         }
         Err(error) => {

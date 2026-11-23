@@ -58,7 +58,6 @@ pub fn render_offscreen(
     color: [f64; 4],
 ) -> Result<OffscreenFrame, RenderError> {
     let device = &renderer.device;
-    let queue = &renderer.queue;
     let extent = wgpu::Extent3d {
         width,
         height,
@@ -103,6 +102,35 @@ pub fn render_offscreen(
         let _ = &mut pass;
     }
 
+    renderer.queue.submit([encoder.finish()]);
+
+    let pixels = readback_texture(renderer, &texture, width, height)?;
+
+    Ok(OffscreenFrame {
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// Copy an RGBA8 texture into a `MAP_READ` buffer, map it and strip the
+/// 256-byte row alignment padding.
+///
+/// # Errors
+/// [`RenderError::Poll`] if awaiting the submission fails,
+/// [`RenderError::Map`] if the readback buffer cannot be mapped.
+pub(crate) fn readback_texture(
+    renderer: &Renderer,
+    texture: &wgpu::Texture,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, RenderError> {
+    let device = &renderer.device;
+    let extent = wgpu::Extent3d {
+        width,
+        height,
+        depth_or_array_layers: 1,
+    };
     // Readback rows are aligned to 256 bytes; repack strips the padding.
     let unpadded_row = u64::from(width) * 4;
     let bytes_per_row = (width * 4).div_ceil(256) * 256;
@@ -112,6 +140,9 @@ pub fn render_offscreen(
         size: buffer_size,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("onyx-readback-encoder"),
     });
     encoder.copy_texture_to_buffer(
         texture.as_image_copy(),
@@ -126,7 +157,7 @@ pub fn render_offscreen(
         extent,
     );
 
-    let submission = queue.submit([encoder.finish()]);
+    let submission = renderer.queue.submit([encoder.finish()]);
     let (sender, receiver) = std::sync::mpsc::channel();
     readback.map_async(wgpu::MapMode::Read, .., move |result| {
         let _ = sender.send(result);
@@ -153,19 +184,14 @@ pub fn render_offscreen(
         .map_err(|error| RenderError::Map {
             message: error.to_string(),
         })?;
-    let mut pixels = Vec::with_capacity(buffer_size as usize);
+    let mut pixels = Vec::with_capacity((unpadded_row * u64::from(height)) as usize);
     for row in 0..u64::from(height) {
         let start = (row * u64::from(bytes_per_row)) as usize;
         pixels.extend_from_slice(&mapping[start..start + unpadded_row as usize]);
     }
     drop(mapping);
     readback.unmap();
-
-    Ok(OffscreenFrame {
-        width,
-        height,
-        pixels,
-    })
+    Ok(pixels)
 }
 
 #[cfg(test)]

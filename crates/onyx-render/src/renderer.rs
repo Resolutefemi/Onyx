@@ -33,6 +33,16 @@ pub enum RenderError {
         /// Map error text from wgpu.
         message: String,
     },
+    /// A render graph could not be scheduled.
+    Graph {
+        /// Scheduling error text from the graph.
+        message: String,
+    },
+    /// The configuration or node declaration is not supported (yet).
+    Unsupported {
+        /// What is unsupported and what replaces it.
+        message: String,
+    },
 }
 
 impl fmt::Display for RenderError {
@@ -42,6 +52,8 @@ impl fmt::Display for RenderError {
             Self::DeviceRequest { message } => write!(f, "device request failed: {message}"),
             Self::Poll { message } => write!(f, "GPU poll failed: {message}"),
             Self::Map { message } => write!(f, "readback map failed: {message}"),
+            Self::Graph { message } => write!(f, "render graph error: {message}"),
+            Self::Unsupported { message } => write!(f, "unsupported: {message}"),
         }
     }
 }

@@ -23,7 +23,7 @@ Sub-5ms Agentic MCP Control · Bevy-class ECS · wgpu Renderer · WASM Component
 
 Onyx Engine is an open-source, pure-Rust 2D/3D game engine engineered to challenge AAA engines like Unreal Engine in visual capability and raw performance, while surpassing Bevy and Godot in developer velocity, polyglot scripting, and AI-native automation. Onyx exposes its entire simulation loop, asset pipeline, and ECS scene hierarchy via a zero-latency MCP (Model Context Protocol) server — allowing AI agents to execute batch mutations and playtest scenes in under 5 milliseconds.
 
-> **Status: pre-alpha — M0 and M1 (ECS Core) complete; M2 (Renderer) in progress.** The archetype SoA `World` with change detection, a scheduler that dispatches read-only system batches on real threads, command-bus transactions, and `#[derive(OnyxReflect)]` reflection with JSON serialization have all landed. M2's foundation is in: `wgpu` 30 adapter/device init with graceful headless degradation, a cycle-checked render graph, and offscreen clear-pass rendering with GPU readback validation (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md) (see the [roadmap](#roadmap)).
+> **Status: pre-alpha — M0 and M1 (ECS Core) complete; M2 (Renderer) in progress.** The archetype SoA `World` with change detection, a scheduler that dispatches read-only system batches on real threads, command-bus transactions, and `#[derive(OnyxReflect)]` reflection with JSON serialization have all landed. M2 has its foundation and first GPU work: `wgpu` 30 adapter/device init with graceful headless degradation, a resource-driven render graph (inferred producer→consumer edges, cycle detection), a real WGSL triangle pipeline with a deterministic pixel contract, and single-submission graph execution with per-target readback (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md) (see the [roadmap](#roadmap)).
 
 ## Why Onyx?
 
@@ -117,7 +117,7 @@ Key properties:
 | --- | --- |
 | **M0 — Scaffold** | Cargo workspace, CI, brand, PRD sign-off ✅ *(complete)* |
 | **M1 — ECS Core** | Archetype ECS, scheduler, command bus, reflection & serialization ✅ *(complete — sparse-set side tables consciously deferred: unit-struct components already tag entities through archetypes; revisit if churn benchmarks demand it)* |
-| **M2 — Renderer** | wgpu HAL, forward PBR, 2D suite, post-processing 🚧 *(in progress — wgpu 30 adapter/device init with graceful NoAdapter, DAG render graph with cycle detection, offscreen clear-pass readback validation landed; surfaces/present, parallel graph execution and the real pipelines next)* |
+| **M2 — Renderer** | wgpu HAL, forward PBR, 2D suite, post-processing 🚧 *(in progress — wgpu 30 adapter/device init with graceful NoAdapter, resource-driven DAG graph with inferred edges + cycle detection, WGSL triangle pipeline with pixel-contract validation, single-submission graph executor landed; surfaces/present, sampling, parallel encoding, PBR and the 2D suite next)* |
 | **M3 — MCP Control Plane** | `rmcp` JSON-RPC server, `batch_execute`, headless sim, undo/redo bridge |
 | **M4 — Physics & Animation** | Rapier integration, character controller, skeletal animation & blending |
 | **M5 — Editor** | Visual editor, inspector, gizmos, prefab system |

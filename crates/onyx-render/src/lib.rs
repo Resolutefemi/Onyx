@@ -4,24 +4,35 @@
 //! Graphics Pipeline), §3 (Lighting, Shadows & Atmosphere) and §4 (Materials,
 //! Shaders & Post-Processing).
 //!
-//! M2 (first increment) lands the hardware foundation:
+//! M2 (first increment) landed the hardware foundation:
 //!
 //! - [`renderer::Renderer`] — `wgpu` instance/adapter/device/queue setup with
 //!   graceful degradation: GPU-less (headless) machines get
 //!   [`renderer::RenderError::NoAdapter`], never a panic,
-//! - [`graph::RenderGraph`] — named nodes with explicit dependencies,
-//!   Kahn topological execution order, cycle detection (resource-based
-//!   automatic barrier insertion lands with the real passes),
 //! - [`offscreen::render_offscreen`] — clear-pass rendering into an offscreen
-//!   RGBA8 sRGB texture with GPU readback, validating the whole device →
-//!   encoder → submit → map pipeline without needing a window.
+//!   RGBA8 sRGB texture with GPU readback.
 //!
-//! Still ahead in M2: surfaces and present, the DAG-driven parallel graph
-//! execution with automatic barriers, forward PBR, the 2D suite and the
-//! post-processing stack.
+//! M2 (second increment) adds the first real GPU work:
+//!
+//! - [`graph::RenderGraph`] — nodes declare resource reads/writes; edges are
+//!   inferred (producer before consumer, conflicting writers in declaration
+//!   order) and cycles through resources are rejected,
+//! - [`pipeline`] — the first WGSL pipeline: a vertex-colored triangle with a
+//!   deterministic pixel contract (center = triangle color, corners =
+//!   background),
+//! - [`executor::execute_offscreen`] — graph execution: one command encoder,
+//!   passes in topological order, one submission, per-target readback. wgpu
+//!   inserts GPU barriers automatically from real resource usage within a
+//!   submission.
+//!
+//! Still ahead in M2: surfaces and present, bind groups and resource
+//! sampling, parallel multi-encoder graph execution, forward PBR, the 2D
+//! suite and the post-processing stack.
 
+pub mod executor;
 pub mod graph;
 pub mod offscreen;
+pub mod pipeline;
 pub mod renderer;
 
 /// Physical graphics backend targeted by the hardware abstraction layer.
@@ -87,8 +98,13 @@ impl Default for RendererConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineId(pub u32);
 
+pub use executor::{execute_offscreen, PassKind, ResourceSpec};
 pub use graph::{GraphError, RenderGraph, RenderGraphNode};
-pub use offscreen::{render_offscreen, OffscreenFrame};
+pub use offscreen::{linear_to_srgb8, render_offscreen, OffscreenFrame};
+pub use pipeline::{
+    create_triangle_pipeline, render_triangle_offscreen, triangle_vertex_buffer, vertex_bytes,
+    Vertex, TRIANGLE_WGSL,
+};
 pub use renderer::{RenderError, Renderer};
 
 #[cfg(test)]
