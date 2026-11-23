@@ -35,9 +35,21 @@
 //! - [`resources::srgb8_to_linear`] — the exact sRGB inverse for test
 //!   contracts.
 //!
-//! Still ahead in M2: MSAA inside the render graph (per-target sample
-//! counts and resolve nodes), surfaces and present, parallel multi-encoder
-//! graph execution, forward PBR, the 2D suite and the post-processing stack.
+//! M2 (fourth increment) scales the graph executor:
+//!
+//! - [`graph::RenderGraph::execution_waves`] — wavefront decomposition: wave
+//!   0 is the producer-free set, a consumer lands after its latest producer;
+//!   conflicting writers always cross waves,
+//! - [`executor::execute_offscreen_parallel`] — each wave's nodes encode
+//!   concurrently on their own threads and command encoders, each wave
+//!   submits in one call, and submission order makes cross-wave dependencies
+//!   safe; results are bit-identical to the sequential executor (tested),
+//! - [`executor::ResourceSpec::samples`] — per-target MSAA: multisampled
+//!   attachments resolve into single-sample readback textures, pipelines are
+//!   built per sample count and validated against the adapter up front.
+//!
+//! Still ahead in M2: sampling passes inside the graph (reads), surfaces and
+//! present, forward PBR, the 2D suite and the post-processing stack.
 
 pub mod executor;
 pub mod graph;
@@ -109,7 +121,7 @@ impl Default for RendererConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PipelineId(pub u32);
 
-pub use executor::{execute_offscreen, PassKind, ResourceSpec};
+pub use executor::{execute_offscreen, execute_offscreen_parallel, PassKind, ResourceSpec};
 pub use graph::{GraphError, RenderGraph, RenderGraphNode};
 pub use offscreen::{linear_to_srgb8, render_offscreen, OffscreenFrame};
 pub use pipeline::{

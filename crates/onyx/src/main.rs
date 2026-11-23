@@ -105,16 +105,8 @@ fn run_render_command() {
             );
 
             let resources = [
-                ResourceSpec {
-                    name: "scene",
-                    width: 64,
-                    height: 64,
-                },
-                ResourceSpec {
-                    name: "post",
-                    width: 64,
-                    height: 64,
-                },
+                ResourceSpec::new("scene", 64, 64),
+                ResourceSpec::new("post", 64, 64),
             ];
             let kinds = |name: &str| match name {
                 "triangle" => Some(PassKind::Triangle {

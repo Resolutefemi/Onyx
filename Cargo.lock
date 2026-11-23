@@ -525,7 +525,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "onyx"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "onyx-core",
  "onyx-ecs",
@@ -537,36 +537,36 @@ dependencies = [
 
 [[package]]
 name = "onyx-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "onyx-reflect",
 ]
 
 [[package]]
 name = "onyx-ecs"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "onyx-core",
 ]
 
 [[package]]
 name = "onyx-mcp"
-version = "0.7.0"
+version = "0.8.0"
 
 [[package]]
 name = "onyx-reflect"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "onyx-reflect-macro",
 ]
 
 [[package]]
 name = "onyx-reflect-macro"
-version = "0.7.0"
+version = "0.8.0"
 
 [[package]]
 name = "onyx-render"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "pollster",
  "wgpu",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "onyx-script"
-version = "0.7.0"
+version = "0.8.0"
 
 [[package]]
 name = "ordered-float"

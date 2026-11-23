@@ -31,7 +31,7 @@ pub const CRATES: &[(&str, &str)] = &[
     ),
     (
         "onyx-render",
-        "wgpu HAL, DAG graph, bind groups + uniforms + textures, textured quad, MSAA (PRD S2-S4; M2 in progress)",
+        "wgpu HAL, DAG graph, MSAA + parallel wave executor, bind groups + uniforms + textures (PRD S2-S4; M2 in progress)",
     ),
     (
         "onyx-mcp",
