@@ -9,4 +9,4 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-onyx-reflect = { path = "../onyx-reflect", version = "0.6.0" }
+onyx-reflect = { path = "../onyx-reflect", version = "0.7.0" }

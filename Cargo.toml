@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.87.0"
 license = "MIT"
@@ -11,13 +11,13 @@ repository = "https://github.com/Resolutefemi/Onyx"
 authors = ["Resolute Femi <ariyooluwafemi487@gmail.com>"]
 
 [workspace.dependencies]
-onyx-core = { path = "crates/onyx-core", version = "0.6.0" }
-onyx-ecs = { path = "crates/onyx-ecs", version = "0.6.0" }
-onyx-mcp = { path = "crates/onyx-mcp", version = "0.6.0" }
-onyx-render = { path = "crates/onyx-render", version = "0.6.0" }
-onyx-script = { path = "crates/onyx-script", version = "0.6.0" }
-onyx-reflect = { path = "crates/onyx-reflect", version = "0.6.0" }
-onyx-reflect-macro = { path = "crates/onyx-reflect-macro", version = "0.6.0" }
+onyx-core = { path = "crates/onyx-core", version = "0.7.0" }
+onyx-ecs = { path = "crates/onyx-ecs", version = "0.7.0" }
+onyx-mcp = { path = "crates/onyx-mcp", version = "0.7.0" }
+onyx-render = { path = "crates/onyx-render", version = "0.7.0" }
+onyx-script = { path = "crates/onyx-script", version = "0.7.0" }
+onyx-reflect = { path = "crates/onyx-reflect", version = "0.7.0" }
+onyx-reflect-macro = { path = "crates/onyx-reflect-macro", version = "0.7.0" }
 
 # M2 (renderer) — the first milestone that introduces external dependencies.
 wgpu = "30.0.2"

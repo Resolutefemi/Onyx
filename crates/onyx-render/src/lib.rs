@@ -25,15 +25,26 @@
 //!   inserts GPU barriers automatically from real resource usage within a
 //!   submission.
 //!
-//! Still ahead in M2: surfaces and present, bind groups and resource
-//! sampling, parallel multi-encoder graph execution, forward PBR, the 2D
-//! suite and the post-processing stack.
+//! M2 (third increment) adds bind groups and the resource layer:
+//!
+//! - [`resources`] — bind group layout + bind group (uniform, texture,
+//!   sampler), `QuadUniformBuffer` with queue writes, `Rgba8UnormSrgb`
+//!   texture upload, nearest/linear samplers, a vertexless textured-quad
+//!   pipeline with a pixel-exact round-trip contract (tint in linear space,
+//!   uv sub-window sampling) and 4× MSAA with resolve,
+//! - [`resources::srgb8_to_linear`] — the exact sRGB inverse for test
+//!   contracts.
+//!
+//! Still ahead in M2: MSAA inside the render graph (per-target sample
+//! counts and resolve nodes), surfaces and present, parallel multi-encoder
+//! graph execution, forward PBR, the 2D suite and the post-processing stack.
 
 pub mod executor;
 pub mod graph;
 pub mod offscreen;
 pub mod pipeline;
 pub mod renderer;
+pub mod resources;
 
 /// Physical graphics backend targeted by the hardware abstraction layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -106,6 +117,12 @@ pub use pipeline::{
     Vertex, TRIANGLE_WGSL,
 };
 pub use renderer::{RenderError, Renderer};
+pub use resources::{
+    create_quad_bind_group, create_quad_bind_layout, create_quad_pipeline, create_rgba_texture,
+    create_sampler, create_triangle_pipeline_msaa, render_quad_offscreen,
+    render_triangle_msaa_offscreen, srgb8_to_linear, texture_view, QuadUniform, QuadUniformBuffer,
+    QUAD_WGSL,
+};
 
 #[cfg(test)]
 mod tests {
