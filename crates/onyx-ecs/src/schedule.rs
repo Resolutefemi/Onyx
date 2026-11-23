@@ -3,9 +3,11 @@
 //!
 //! Systems declare what they read and write via [`SystemAccess`]; the
 //! schedule rejects two systems in the same stage whose access overlaps on a
-//! write (write/write or write/read). The same declarations will drive the
-//! parallel executor — independent systems dispatched across the work-stealing
-//! pool — in the next M1 increment.
+//! write (write/write or write/read). The same declarations drive the
+//! executor: consecutive read-only systems ([`reader_system`]) form parallel
+//! batches that run concurrently on scoped threads against a shared
+//! [`World`], while writing systems execute one at a time between batches,
+//! preserving declaration order.
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -109,15 +111,36 @@ pub trait System: Send {
     /// Stable human-readable system name.
     fn name(&self) -> &'static str;
 
-    /// Declared component access (conflict detection now, parallel dispatch
-    /// in the next M1 increment).
+    /// Declared component access: drives same-stage conflict detection and
+    /// the reader/writer batching that decides what runs in parallel.
     fn access(&self) -> SystemAccess;
 
-    /// Execute the system against the world.
+    /// Whether the system executes against a *shared* world and is eligible
+    /// for parallel reader batches. Only reader systems built with
+    /// [`reader_system`] are readers; the conservative default is `false`
+    /// (exclusive access), so writer-style systems with empty access are
+    /// never misclassified.
+    fn is_reader(&self) -> bool {
+        false
+    }
+
+    /// Execute the system against the world with exclusive access. Writers
+    /// implement this; reader systems built with [`reader_system`] panic here
+    /// (the scheduler never calls it on them).
     fn run(&mut self, world: &mut World);
+
+    /// Execute the system against a shared world. Reader systems implement
+    /// this and run concurrently inside a batch; writer systems panic here.
+    fn run_shared(&mut self, world: &World) {
+        let _ = world;
+        panic!(
+            "system '{}' declares read-only access but only implements run(&mut World); build it with onyx_ecs::reader_system",
+            self.name()
+        );
+    }
 }
 
-/// Closure-backed [`System`].
+/// Closure-backed writing [`System`] (`FnMut(&mut World)`).
 #[allow(clippy::type_complexity)]
 pub struct FnSystem<F: FnMut(&mut World) + Send> {
     name: &'static str,
@@ -139,7 +162,41 @@ impl<F: FnMut(&mut World) + Send + 'static> System for FnSystem<F> {
     }
 }
 
-/// Build a [`System`] from a closure with declared access.
+/// Closure-backed read-only [`System`] (`FnMut(&World)`), dispatched in
+/// parallel batches by the scheduler.
+#[allow(clippy::type_complexity)]
+pub struct FnReaderSystem<F: FnMut(&World) + Send> {
+    name: &'static str,
+    access: SystemAccess,
+    run: F,
+}
+
+impl<F: FnMut(&World) + Send + 'static> System for FnReaderSystem<F> {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn access(&self) -> SystemAccess {
+        self.access.clone()
+    }
+
+    fn is_reader(&self) -> bool {
+        true
+    }
+
+    fn run(&mut self, _world: &mut World) {
+        panic!(
+            "'{}' is a reader system and must not be run with exclusive access",
+            self.name
+        );
+    }
+
+    fn run_shared(&mut self, world: &World) {
+        (self.run)(world);
+    }
+}
+
+/// Build a writing [`System`] from a closure with declared access.
 #[must_use]
 #[allow(clippy::type_complexity)]
 pub fn system<F>(name: &'static str, access: SystemAccess, run: F) -> FnSystem<F>
@@ -147,6 +204,25 @@ where
     F: FnMut(&mut World) + Send + 'static,
 {
     FnSystem { name, access, run }
+}
+
+/// Build a read-only [`System`] from a closure over a shared [`World`].
+/// Reader systems run concurrently in scheduler batches; the access
+/// declaration must not contain writes.
+///
+/// # Panics
+/// If `access` declares any writes.
+#[must_use]
+#[allow(clippy::type_complexity)]
+pub fn reader_system<F>(name: &'static str, access: SystemAccess, run: F) -> FnReaderSystem<F>
+where
+    F: FnMut(&World) + Send + 'static,
+{
+    assert!(
+        access.writes.is_empty(),
+        "reader_system '{name}' must declare reads only"
+    );
+    FnReaderSystem { name, access, run }
 }
 
 /// Two systems in the same stage declare conflicting access.
@@ -177,9 +253,25 @@ impl fmt::Display for ScheduleConflictError {
 
 impl std::error::Error for ScheduleConflictError {}
 
+/// Run a run of consecutive reader systems against a shared world. A lone
+/// reader executes inline (no thread spawn); larger batches fan out across
+/// scoped threads.
+fn run_reader_batch(systems: &mut [Box<dyn System>], world: &World) {
+    if systems.len() == 1 {
+        systems[0].run_shared(world);
+        return;
+    }
+    std::thread::scope(|scope| {
+        for system in systems.iter_mut() {
+            scope.spawn(move || system.run_shared(world));
+        }
+    });
+}
+
 /// Stage-ordered system schedule (PRD §1). Systems run in canonical stage
-/// order; within a stage, access conflicts are rejected at registration time
-/// so the ordering is always well-defined (and later, parallelizable).
+/// order; within a stage, access conflicts are rejected at registration time.
+/// Runs of consecutive reader systems are dispatched as parallel batches
+/// between the writers, whose relative order is preserved.
 #[derive(Default)]
 pub struct Schedule {
     stages: Vec<Stage>,
@@ -271,6 +363,7 @@ impl Schedule {
     }
 
     /// Builder variant: `Schedule::standard().with_system(Stage::Update, my_system)`.
+    /// Works for both writers ([`system`]) and readers ([`reader_system`]).
     ///
     /// # Panics
     /// Same as [`Schedule::add_system`].
@@ -281,12 +374,29 @@ impl Schedule {
     }
 
     /// Run every registered system in canonical stage order.
+    ///
+    /// Consecutive reader systems within a stage form one parallel batch:
+    /// they execute concurrently against a shared [`World`] on scoped
+    /// threads. Writers run one at a time in declaration order, flushing the
+    /// pending batch first. Reader order inside a batch is nondeterministic,
+    /// so readers must not have externally ordered side effects.
     pub fn run(&mut self, world: &mut World) {
         for stage in &self.stages {
-            if let Some(systems) = self.systems.get_mut(stage) {
-                for system in systems {
-                    system.run(world);
+            let Some(systems) = self.systems.get_mut(stage) else {
+                continue;
+            };
+            let mut batch_start = 0usize;
+            for index in 0..systems.len() {
+                if !systems[index].is_reader() {
+                    if index > batch_start {
+                        run_reader_batch(&mut systems[batch_start..index], world);
+                    }
+                    systems[index].run(world);
+                    batch_start = index + 1;
                 }
+            }
+            if batch_start < systems.len() {
+                run_reader_batch(&mut systems[batch_start..], world);
             }
         }
     }
@@ -297,8 +407,10 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    struct Alpha;
-    struct Beta;
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Alpha(f32);
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Beta(f32);
 
     fn noop_system(name: &'static str, access: SystemAccess) -> Box<dyn System> {
         Box::new(system(name, access, |_world: &mut World| {}))
@@ -417,5 +529,131 @@ mod tests {
         let mut world = World::new();
         schedule.run(&mut world);
         assert_eq!(*order.lock().expect("lock"), vec!["early", "late"]);
+    }
+
+    #[test]
+    fn reader_batches_run_before_the_next_writer() {
+        let log = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let mut world = World::new();
+        let entity = world.spawn();
+        world.insert(entity, Alpha(0.0));
+        world.insert(entity, Beta(0.0));
+
+        let r1_log = Arc::clone(&log);
+        let r2_log = Arc::clone(&log);
+        let writer_log = Arc::clone(&log);
+        let r3_log = Arc::clone(&log);
+
+        let mut schedule = Schedule::new();
+        schedule
+            .try_add_system(
+                Stage::Update,
+                Box::new(reader_system(
+                    "r1",
+                    SystemAccess::new().read::<Alpha>(),
+                    move |_world: &World| {
+                        r1_log.lock().expect("lock").push("r1");
+                    },
+                )),
+            )
+            .expect("registered");
+        schedule
+            .try_add_system(
+                Stage::Update,
+                Box::new(reader_system(
+                    "r2",
+                    SystemAccess::new().read::<Alpha>(),
+                    move |_world: &World| {
+                        r2_log.lock().expect("lock").push("r2");
+                    },
+                )),
+            )
+            .expect("registered");
+        schedule
+            .try_add_system(
+                Stage::Update,
+                Box::new(system(
+                    "writer",
+                    SystemAccess::new().write::<Beta>(),
+                    move |world: &mut World| {
+                        writer_log.lock().expect("lock").push("writer");
+                        if let Some(beta) = world.get_mut::<Beta>(entity) {
+                            beta.0 += 1.0;
+                        }
+                    },
+                )),
+            )
+            .expect("registered");
+        schedule
+            .try_add_system(
+                Stage::Update,
+                Box::new(reader_system(
+                    "r3",
+                    SystemAccess::new().read::<Alpha>(),
+                    move |_world: &World| {
+                        r3_log.lock().expect("lock").push("r3");
+                    },
+                )),
+            )
+            .expect("registered");
+
+        schedule.run(&mut world);
+
+        let order = log.lock().expect("lock").clone();
+        let writer_index = order
+            .iter()
+            .position(|name| *name == "writer")
+            .expect("writer ran");
+        let r1_index = order.iter().position(|name| *name == "r1").expect("r1 ran");
+        let r2_index = order.iter().position(|name| *name == "r2").expect("r2 ran");
+        let r3_index = order.iter().position(|name| *name == "r3").expect("r3 ran");
+        assert!(
+            r1_index < writer_index && r2_index < writer_index,
+            "the pending reader batch must flush before the writer runs"
+        );
+        assert!(
+            r3_index > writer_index,
+            "systems declared after the writer must run after it"
+        );
+        assert_eq!(world.get::<Beta>(entity), Some(&Beta(1.0)));
+    }
+
+    #[test]
+    fn consecutive_readers_share_one_parallel_batch() {
+        let hits = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let names = ["reader_0", "reader_1", "reader_2", "reader_3"];
+        let mut schedule = Schedule::new();
+        for name in names {
+            let hits_in_system = Arc::clone(&hits);
+            schedule
+                .try_add_system(
+                    Stage::Update,
+                    Box::new(reader_system(
+                        name,
+                        SystemAccess::new().read::<Alpha>(),
+                        move |_world: &World| {
+                            hits_in_system.lock().expect("lock").push(name);
+                        },
+                    )),
+                )
+                .expect("registered");
+        }
+
+        let mut world = World::new();
+        schedule.run(&mut world);
+
+        let mut ran = hits.lock().expect("lock").clone();
+        ran.sort_unstable();
+        assert_eq!(ran, vec!["reader_0", "reader_1", "reader_2", "reader_3"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must declare reads only")]
+    fn reader_system_rejects_write_access() {
+        let _ = reader_system(
+            "bad",
+            SystemAccess::new().write::<Alpha>(),
+            |_world: &World| {},
+        );
     }
 }

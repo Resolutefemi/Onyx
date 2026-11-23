@@ -40,6 +40,11 @@ fn cli_sim_runs_and_reports() {
     );
     assert!(stdout.contains("ticks"), "unexpected: {stdout}");
     assert!(stdout.contains("checksum"), "unexpected: {stdout}");
+    assert!(stdout.contains("sample"), "unexpected: {stdout}");
+    assert!(
+        stdout.contains("\"x\""),
+        "reflected position JSON missing from sim output: {stdout}"
+    );
 }
 
 #[test]

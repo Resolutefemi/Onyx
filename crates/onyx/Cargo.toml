@@ -12,6 +12,7 @@ authors.workspace = true
 onyx-core.workspace = true
 onyx-ecs.workspace = true
 onyx-mcp.workspace = true
+onyx-reflect.workspace = true
 onyx-render.workspace = true
 onyx-script.workspace = true
 

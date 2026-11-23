@@ -20,7 +20,7 @@ fn main() {
 
 fn print_info() {
     println!("{ENGINE_NAME} v{ENGINE_VERSION}");
-    println!("status: pre-alpha (M0 scaffold complete; M1 ECS core in progress)");
+    println!("status: pre-alpha (M0 and M1 complete; renderer next)");
     println!();
     println!("Workspace crates:");
     for (name, scope) in CRATES {
@@ -67,6 +67,7 @@ fn run_sim_command(rest: &[String]) {
     println!("{ENGINE_NAME} sim: {entities} entities x {frames} frames");
     println!("  ticks      {}", report.ticks);
     println!("  checksum   {:.3}", report.checksum);
+    println!("  sample     {}", report.sample_json);
     println!("  elapsed    {:.1} ms", report.elapsed_ms);
 }
 

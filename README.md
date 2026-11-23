@@ -23,7 +23,7 @@ Sub-5ms Agentic MCP Control · Bevy-class ECS · wgpu Renderer · WASM Component
 
 Onyx Engine is an open-source, pure-Rust 2D/3D game engine engineered to challenge AAA engines like Unreal Engine in visual capability and raw performance, while surpassing Bevy and Godot in developer velocity, polyglot scripting, and AI-native automation. Onyx exposes its entire simulation loop, asset pipeline, and ECS scene hierarchy via a zero-latency MCP (Model Context Protocol) server — allowing AI agents to execute batch mutations and playtest scenes in under 5 milliseconds.
 
-> **Status: pre-alpha — M0 complete, M1 (ECS Core) in progress.** The archetype SoA `World`, access-declared scheduler, change detection and command-bus transactions have landed (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)); parallel system dispatch, sparse-set tags and reflection are the next M1 increments. The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md) (see the [roadmap](#roadmap)).
+> **Status: pre-alpha — M0 and M1 (ECS Core) complete.** The archetype SoA `World` with change detection, a scheduler that dispatches read-only system batches on real threads, command-bus transactions, and `#[derive(OnyxReflect)]` reflection with JSON serialization have all landed (see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)). Next: M2, the wgpu renderer. The full subsystem-by-subsystem specification lives in [`docs/PRD.md`](docs/PRD.md) (see the [roadmap](#roadmap)).
 
 ## Why Onyx?
 
@@ -116,7 +116,7 @@ Key properties:
 | Milestone | Scope |
 | --- | --- |
 | **M0 — Scaffold** | Cargo workspace, CI, brand, PRD sign-off ✅ *(complete)* |
-| **M1 — ECS Core** | Archetype ECS, scheduler, command bus, reflection & serialization 🚧 *(in progress — archetype SoA `World`, change detection, access-checked scheduler & command-bus transactions landed; parallel dispatch, sparse-set tags, reflection & serialization next)* |
+| **M1 — ECS Core** | Archetype ECS, scheduler, command bus, reflection & serialization ✅ *(complete — sparse-set side tables consciously deferred: unit-struct components already tag entities through archetypes; revisit if churn benchmarks demand it)* |
 | **M2 — Renderer** | wgpu HAL, forward PBR, 2D suite, post-processing |
 | **M3 — MCP Control Plane** | `rmcp` JSON-RPC server, `batch_execute`, headless sim, undo/redo bridge |
 | **M4 — Physics & Animation** | Rapier integration, character controller, skeletal animation & blending |
@@ -125,7 +125,7 @@ Key properties:
 
 ## Contributing
 
-The engine is in early implementation (M0 complete, M1 ECS core in progress) — the most valuable contributions right now are feedback on [`docs/PRD.md`](docs/PRD.md), reference implementations of isolated subsystems (see the [architecture templates](#architecture-reference-templates)), and MCP tool-schema review from AI-tooling developers. For build instructions and the workspace layout, see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+The engine is in early implementation (M0 and M1 complete; M2 renderer next) — the most valuable contributions right now are feedback on [`docs/PRD.md`](docs/PRD.md), reference implementations of isolated subsystems (see the [architecture templates](#architecture-reference-templates)), and MCP tool-schema review from AI-tooling developers. For build instructions and the workspace layout, see [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## License
 
