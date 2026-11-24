@@ -48,8 +48,21 @@
 //!   attachments resolve into single-sample readback textures, pipelines are
 //!   built per sample count and validated against the adapter up front.
 //!
-//! Still ahead in M2: sampling passes inside the graph (reads), surfaces and
-//! present, forward PBR, the 2D suite and the post-processing stack.
+//! M2 (fifth increment) makes sampling passes first-class graph citizens:
+//!
+//! - [`executor::PassKind::TexturedQuad`] — a node whose declared read
+//!   resource is bound as a texture through the quad bind group: it clears
+//!   its write target and draws the source through tint and uv window;
+//!   nearest + full-window + white tint is a pixel-exact copy (tested),
+//! - one shared validation path (`plan_node`) for both executors: read
+//!   declarations must match the pass kind, sampling requires declared
+//!   single-sample resources on both ends,
+//! - target textures gain `TEXTURE_BINDING` so they can be sampled by later
+//!   passes; wgpu inserts the render-attachment → texture-binding barrier
+//!   automatically.
+//!
+//! Still ahead in M2: surfaces and present, forward PBR, the 2D suite and
+//! the post-processing stack.
 
 pub mod executor;
 pub mod graph;

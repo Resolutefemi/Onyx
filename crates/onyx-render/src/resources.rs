@@ -20,9 +20,9 @@
 //! - [`srgb8_to_linear`] — exact inverse of [`linear_to_srgb8`] so tests can
 //!   compute expected tint results per channel.
 //!
-//! MSAA inside the render graph (per-target sample counts + resolve nodes)
-//! lands with the next increment; this module proves the pass structure
-//! end to end.
+//! The graph executor draws [`crate::executor::PassKind::TexturedQuad`]
+//! passes through this module's bind group: the node's declared read
+//! resource becomes the quad's texture.
 
 use crate::offscreen::{readback_texture, OffscreenFrame};
 use crate::renderer::{RenderError, Renderer};

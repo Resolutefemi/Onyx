@@ -2,9 +2,9 @@
 //! single- or multi-encoder submissions, then per-target readback
 //! (`docs/PRD.md` §2).
 //!
-//! Two executors share one planning phase ([`plan_passes`], which validates
-//! every node and resolves targets before any GPU work) and one allocation
-//! phase:
+//! Two executors share one planning phase ([`plan_wave`], which validates
+//! every node, resolves its targets and its sampled source before any GPU
+//! work) and one allocation phase:
 //!
 //! - [`execute_offscreen`] — the sequential path: one command encoder, all
 //!   passes in topological order, a single submission,
@@ -12,25 +12,36 @@
 //!   into *waves* (see [`crate::graph::RenderGraph::execution_waves`]); every
 //!   node in a wave encodes on its own thread into its own command encoder,
 //!   each wave submits its command buffers in one call, and wave N+1's
-//!   submission follows wave N's on the queue. Write-write conflicts always
-//!   cross waves (the graph edges force it), so parallel results are
-//!   bit-identical to sequential ones — proven by a test.
+//!   submission follows wave N's on the queue. Write-write conflicts and
+//!   write-read pairs always cross waves (the graph edges force it), so
+//!   parallel results are bit-identical to sequential ones — proven by a
+//!   test.
 //!
 //! Within one submission wgpu inserts GPU barriers automatically from the
-//! real resource usage of each pass, and submissions to one queue execute in
-//! order — the graph fixes ORDER, wgpu guarantees synchronization.
+//! real resource usage of each pass — including the render-attachment →
+//! texture-binding transition a sampling pass needs — and submissions to one
+//! queue execute in order: the graph fixes ORDER, wgpu guarantees
+//! synchronization.
 //!
 //! Targets may declare MSAA via [`ResourceSpec::samples`]: the executor then
 //! creates a multisampled attachment and resolves it into the single-sample
 //! readback texture on every pass. Pipelines are built per sample count, and
 //! sample counts are validated against the adapter before any encoding.
+//!
+//! Sampling passes ([`PassKind::TexturedQuad`]) bind the node's declared
+//! read resource as a texture through the quad bind group (uniform +
+//! texture + sampler, `resources`): a node that writes "post" and reads
+//! "scene" draws "scene" onto "post". This increment requires single-sample
+//! resources on both ends of a sampling pass; an MSAA quad pipeline and
+//! multi-target passes land later.
 
 use crate::graph::{GraphError, RenderGraph};
 use crate::offscreen::{readback_texture, OffscreenFrame};
 use crate::pipeline;
 use crate::renderer::{RenderError, Renderer};
-use crate::resources;
-/// What a node renders this increment.
+use crate::resources::{self, QuadUniform, QuadUniformBuffer};
+
+/// What a node renders.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PassKind {
     /// Clear the target to a color.
@@ -42,6 +53,19 @@ pub enum PassKind {
         triangle: [f64; 4],
         /// Load-op clear color behind the triangle.
         background: [f64; 4],
+    },
+    /// Clear the target to `background`, then draw a fullscreen quad sampling
+    /// the node's declared read resource: `tint` multiplies the sampled texel
+    /// in linear space, `uv_window` (offset xy, scale zw) selects the source
+    /// sub-rect. Nearest sampling, full-window white-tint draws are
+    /// pixel-exact copies of the source readback.
+    TexturedQuad {
+        /// RGBA tint multiplied over the sampled texel (linear space).
+        tint: [f64; 4],
+        /// Load-op clear color behind the quad.
+        background: [f64; 4],
+        /// UV window: offset xy, scale zw over the source texture.
+        uv_window: [f64; 4],
     },
 }
 
@@ -83,13 +107,14 @@ impl ResourceSpec {
     }
 }
 
-/// One validated node: its pass kind, the target it writes and that target's
-/// sample count.
+/// One validated node: its pass kind, the target it writes and — for
+/// sampling passes — the target it reads.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct PlannedPass {
     node: &'static str,
     kind: PassKind,
     target_index: usize,
+    read_index: Option<usize>,
 }
 
 /// A declared target and everything the executors need to draw into it.
@@ -98,12 +123,35 @@ struct Target {
     width: u32,
     height: u32,
     /// Single-sample texture: the resolve target when `msaa_view` is set,
-    /// the render target otherwise; always the readback source.
+    /// the render target otherwise; always the readback source and the
+    /// sampling source for read declarations.
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     /// `Some` when `samples > 1`: the multisampled attachment views.
     msaa_view: Option<wgpu::TextureView>,
     samples: u32,
+}
+
+/// Resources shared by every pass encoding of one execution — built once on
+/// the calling thread, shared across worker threads (`RenderPipeline`,
+/// `BindGroupLayout` and `Sampler` are all `Send + Sync`).
+struct PassEncoderContext {
+    quad_pipeline: wgpu::RenderPipeline,
+    quad_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+impl PassEncoderContext {
+    fn new(renderer: &Renderer) -> Self {
+        Self {
+            quad_pipeline: resources::create_quad_pipeline(
+                renderer,
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+            ),
+            quad_layout: resources::create_quad_bind_layout(renderer),
+            sampler: resources::create_sampler(renderer, true),
+        }
+    }
 }
 
 /// Validate sample counts against the adapter before any GPU work.
@@ -126,71 +174,121 @@ fn validate_sample_count(renderer: &Renderer, name: &str, samples: u32) -> Resul
     })
 }
 
-/// Walk the graph in topological order and validate every node before any
-/// GPU work: each node must have a pass kind, read nothing, write exactly one
-/// declared target, and that target's sample count must be supported.
-fn plan_passes(
+/// Validate one node and resolve its declarations into a [`PlannedPass`]:
+/// pass kind required, exactly one declared write target, and read
+/// declarations that match the pass kind (`Clear`/`Triangle` read nothing,
+/// `TexturedQuad` reads exactly one declared single-sample source). Runs
+/// before any GPU work so both executors reject bad graphs up front.
+fn plan_node(
     renderer: &Renderer,
     graph: &RenderGraph,
     resources: &[ResourceSpec],
     kind_of: &dyn Fn(&str) -> Option<PassKind>,
-) -> Result<Vec<PlannedPass>, RenderError> {
-    let order = graph
-        .execution_order()
-        .map_err(|error: GraphError| RenderError::Graph {
-            message: error.to_string(),
-        })?;
-    let mut passes = Vec::with_capacity(order.len());
-    for node_name in order {
-        let Some(kind) = kind_of(node_name) else {
-            return Err(RenderError::Unsupported {
-                message: format!("node '{node_name}' has no pass kind"),
-            });
-        };
-        let node = graph
-            .nodes()
-            .iter()
-            .find(|node| node.name == node_name)
-            .expect("order names come from the graph");
-        if !node.reads.is_empty() {
-            return Err(RenderError::Unsupported {
-                message: format!(
-                    "node '{}' reads resources; sampling passes land with the 2D suite",
-                    node.name
-                ),
-            });
-        }
-        if node.writes.len() != 1 {
-            return Err(RenderError::Unsupported {
-                message: format!(
-                    "node '{}' writes {} targets; multi-target (MRT) passes land later",
-                    node.name,
-                    node.writes.len()
-                ),
-            });
-        }
-        let written = node.writes[0];
-        let target_index = resources
-            .iter()
-            .position(|spec| spec.name == written)
-            .ok_or_else(|| RenderError::Unsupported {
-                message: format!(
-                    "node '{}' writes undeclared resource '{written}'",
-                    node.name
-                ),
-            })?;
-        validate_sample_count(renderer, written, resources[target_index].samples)?;
-        passes.push(PlannedPass {
-            node: node_name,
-            kind,
-            target_index,
+    node_name: &'static str,
+) -> Result<PlannedPass, RenderError> {
+    let Some(kind) = kind_of(node_name) else {
+        return Err(RenderError::Unsupported {
+            message: format!("node '{node_name}' has no pass kind"),
+        });
+    };
+    let node = graph
+        .nodes()
+        .iter()
+        .find(|node| node.name == node_name)
+        .expect("order names come from the graph");
+    let reads_expected = match kind {
+        PassKind::Clear(_) | PassKind::Triangle { .. } => 0,
+        PassKind::TexturedQuad { .. } => 1,
+    };
+    if node.reads.len() != reads_expected {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "node '{}' ({}) must read exactly {} resource(s), declares {}",
+                node.name,
+                match kind {
+                    PassKind::Clear(_) => "Clear",
+                    PassKind::Triangle { .. } => "Triangle",
+                    PassKind::TexturedQuad { .. } => "TexturedQuad",
+                },
+                reads_expected,
+                node.reads.len()
+            ),
         });
     }
-    Ok(passes)
+    if node.writes.len() != 1 {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "node '{}' writes {} targets; multi-target (MRT) passes land later",
+                node.name,
+                node.writes.len()
+            ),
+        });
+    }
+    let written = node.writes[0];
+    let target_index = resources
+        .iter()
+        .position(|spec| spec.name == written)
+        .ok_or_else(|| RenderError::Unsupported {
+            message: format!(
+                "node '{}' writes undeclared resource '{written}'",
+                node.name
+            ),
+        })?;
+    validate_sample_count(renderer, written, resources[target_index].samples)?;
+
+    // A sampling pass reads a texture: the source must be a declared
+    // single-sample target (multisampled textures are not sampleable by this
+    // pipeline), and this increment draws the quad only into single-sample
+    // targets.
+    let read_index = match kind {
+        PassKind::TexturedQuad { .. } => {
+            let source = node.reads[0];
+            let index = resources
+                .iter()
+                .position(|spec| spec.name == source)
+                .ok_or(RenderError::Unsupported {
+                    message: format!("node '{}' reads undeclared resource '{source}'", node.name),
+                })?;
+            let source_samples = resources[index].samples;
+            if source_samples != 1 || resources[target_index].samples != 1 {
+                return Err(RenderError::Unsupported {
+                    message: format!(
+                        "sampling pass '{}' requires single-sample resources: \
+                         source '{source}' is {source_samples}x, \
+                         target '{written}' is {}x",
+                        node.name, resources[target_index].samples
+                    ),
+                });
+            }
+            Some(index)
+        }
+        _ => None,
+    };
+    Ok(PlannedPass {
+        node: node_name,
+        kind,
+        target_index,
+        read_index,
+    })
+}
+
+/// Validate one wave of nodes (in wave order) into planned passes.
+fn plan_wave(
+    renderer: &Renderer,
+    graph: &RenderGraph,
+    resources: &[ResourceSpec],
+    kind_of: &dyn Fn(&str) -> Option<PassKind>,
+    wave: &[&'static str],
+) -> Result<Vec<PlannedPass>, RenderError> {
+    wave.iter()
+        .map(|&node_name| plan_node(renderer, graph, resources, kind_of, node_name))
+        .collect()
 }
 
 /// Allocate every declared resource. Targets with `samples > 1` get a
-/// multisampled attachment alongside the single-sample resolve texture.
+/// multisampled attachment alongside the single-sample resolve texture; the
+/// single-sample texture carries `TEXTURE_BINDING` so sampling passes can
+/// bind it.
 fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Target> {
     let device = &renderer.device;
     resources
@@ -208,7 +306,9 @@ fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Targ
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -260,14 +360,18 @@ fn triangle_pipeline_for(
     built
 }
 
-/// Encode one planned pass into `encoder`, targeting `target`.
+/// Encode one planned pass into `encoder`, writing `targets[pass.
+/// target_index]` and — for sampling passes — binding
+/// `targets[pass.read_index]` as the quad texture.
 fn encode_pass(
     renderer: &Renderer,
     encoder: &mut wgpu::CommandEncoder,
     pass: &PlannedPass,
-    target: &Target,
-    pipelines: &mut Vec<(u32, wgpu::RenderPipeline)>,
+    targets: &[Target],
+    context: &PassEncoderContext,
+    triangle_pipelines: &mut Vec<(u32, wgpu::RenderPipeline)>,
 ) {
+    let target = &targets[pass.target_index];
     let attachment_view = target.msaa_view.as_ref().unwrap_or(&target.view);
     let resolve_target = target.msaa_view.as_ref().map(|_| &target.view);
     match pass.kind {
@@ -322,11 +426,67 @@ fn encode_pass(
                 renderer,
                 wgpu::TextureFormat::Rgba8UnormSrgb,
                 target.samples,
-                pipelines,
+                triangle_pipelines,
             );
             pass_handle.set_pipeline(&pipeline);
             pass_handle.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass_handle.draw(0..3, 0..1);
+        }
+        PassKind::TexturedQuad {
+            tint,
+            background,
+            uv_window,
+        } => {
+            // Each sampling pass owns its uniform buffer and bind group —
+            // safe on worker threads: Device is Send + Sync and the queue
+            // write behind create_buffer_init is ordered before the next
+            // submission.
+            let uniform = QuadUniform {
+                tint: [
+                    tint[0] as f32,
+                    tint[1] as f32,
+                    tint[2] as f32,
+                    tint[3] as f32,
+                ],
+                uv_window: [
+                    uv_window[0] as f32,
+                    uv_window[1] as f32,
+                    uv_window[2] as f32,
+                    uv_window[3] as f32,
+                ],
+            };
+            let uniform_buffer = QuadUniformBuffer::new(renderer, &uniform);
+            let read_index = pass.read_index.expect("TexturedQuad plans a read");
+            let source_view = &targets[read_index].view;
+            let bind_group = resources::create_quad_bind_group(
+                renderer,
+                &context.quad_layout,
+                &uniform_buffer,
+                source_view,
+                &context.sampler,
+            );
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: background[0],
+                        g: background[1],
+                        b: background[2],
+                        a: background[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass_handle = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("onyx-graph-textured-quad"),
+                color_attachments: &[Some(attachment)],
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            pass_handle.set_pipeline(&context.quad_pipeline);
+            pass_handle.set_bind_group(0, &bind_group, &[]);
+            pass_handle.draw(0..6, 0..1);
         }
     }
 }
@@ -366,21 +526,31 @@ pub fn execute_offscreen(
     resources: &[ResourceSpec],
     kind_of: &dyn Fn(&str) -> Option<PassKind>,
 ) -> Result<Vec<(&'static str, OffscreenFrame)>, RenderError> {
-    let passes = plan_passes(renderer, graph, resources, kind_of)?;
+    let waves = graph
+        .execution_waves()
+        .map_err(|error: GraphError| RenderError::Graph {
+            message: error.to_string(),
+        })?;
+    let mut planned = Vec::new();
+    for wave in &waves {
+        planned.extend(plan_wave(renderer, graph, resources, kind_of, wave)?);
+    }
     let targets = allocate_targets(renderer, resources);
-    let mut pipelines = Vec::new();
+    let context = PassEncoderContext::new(renderer);
+    let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("onyx-graph-executor"),
         });
-    for pass in &passes {
+    for pass in &planned {
         encode_pass(
             renderer,
             &mut encoder,
             pass,
-            &targets[pass.target_index],
-            &mut pipelines,
+            &targets,
+            &context,
+            &mut triangle_pipelines,
         );
     }
     renderer.queue.submit([encoder.finish()]);
@@ -390,7 +560,8 @@ pub fn execute_offscreen(
 /// Execute `graph` offscreen in parallel: waves of independent nodes encode
 /// concurrently (one thread and one command encoder per node group), each
 /// wave submits its command buffers in one call, and later waves follow on
-/// the queue — submission order makes cross-wave dependencies safe.
+/// the queue — submission order makes cross-wave dependencies safe, so a
+/// sampling pass sees its source written by earlier waves.
 ///
 /// `workers` caps the threads per wave (clamped to at least 1). Results are
 /// bit-identical to [`execute_offscreen`]: the graph's edges force
@@ -414,68 +585,24 @@ pub fn execute_offscreen_parallel(
     // Plan every pass up front so the worker threads only encode.
     let planned: Vec<Vec<PlannedPass>> = waves
         .iter()
-        .map(|wave| {
-            wave.iter()
-                .map(|&node_name| {
-                    let Some(kind) = kind_of(node_name) else {
-                        return Err(RenderError::Unsupported {
-                            message: format!("node '{node_name}' has no pass kind"),
-                        });
-                    };
-                    let node = graph
-                        .nodes()
-                        .iter()
-                        .find(|node| node.name == node_name)
-                        .expect("wave names come from the graph");
-                    if !node.reads.is_empty() {
-                        return Err(RenderError::Unsupported {
-                            message: format!(
-                                "node '{}' reads resources; sampling passes land with the 2D suite",
-                                node.name
-                            ),
-                        });
-                    }
-                    if node.writes.len() != 1 {
-                        return Err(RenderError::Unsupported {
-                            message: format!(
-                                "node '{}' writes {} targets; multi-target (MRT) passes land later",
-                                node.name,
-                                node.writes.len()
-                            ),
-                        });
-                    }
-                    let written = node.writes[0];
-                    let target_index = resources
-                        .iter()
-                        .position(|spec| spec.name == written)
-                        .ok_or_else(|| RenderError::Unsupported {
-                            message: format!(
-                                "node '{}' writes undeclared resource '{written}'",
-                                node.name
-                            ),
-                        })?;
-                    validate_sample_count(renderer, written, resources[target_index].samples)?;
-                    Ok(PlannedPass {
-                        node: node_name,
-                        kind,
-                        target_index,
-                    })
-                })
-                .collect::<Result<Vec<PlannedPass>, RenderError>>()
-        })
+        .map(|wave| plan_wave(renderer, graph, resources, kind_of, wave))
         .collect::<Result<Vec<Vec<PlannedPass>>, RenderError>>()?;
 
     let targets = allocate_targets(renderer, resources);
+    let context = PassEncoderContext::new(renderer);
     let workers = workers.max(1);
 
     for wave in &planned {
-        // Prebuild the pipelines this wave needs — RenderPipeline is
-        // Send + Sync, so threads can share them.
-        let mut pipelines: Vec<(u32, wgpu::RenderPipeline)> = Vec::new();
+        // Prebuild the triangle pipelines this wave needs —
+        // RenderPipeline is Send + Sync, so threads can share them.
+        let mut triangle_pipelines: Vec<(u32, wgpu::RenderPipeline)> = Vec::new();
         for pass in wave {
             if matches!(pass.kind, PassKind::Triangle { .. }) {
                 let target_samples = targets[pass.target_index].samples;
-                if !pipelines.iter().any(|(count, _)| *count == target_samples) {
+                if !triangle_pipelines
+                    .iter()
+                    .any(|(count, _)| *count == target_samples)
+                {
                     let built = if target_samples <= 1 {
                         pipeline::create_triangle_pipeline(
                             renderer,
@@ -488,13 +615,14 @@ pub fn execute_offscreen_parallel(
                             target_samples,
                         )
                     };
-                    pipelines.push((target_samples, built));
+                    triangle_pipelines.push((target_samples, built));
                 }
             }
         }
         let chunk_size = wave.len().div_ceil(workers);
         let targets_ref = &targets;
-        let pipelines_ref = &pipelines;
+        let context_ref = &context;
+        let triangle_pipelines_ref = &triangle_pipelines;
         let command_buffers: Vec<wgpu::CommandBuffer> = std::thread::scope(|scope| {
             wave.chunks(chunk_size)
                 .map(|chunk| {
@@ -505,13 +633,14 @@ pub fn execute_offscreen_parallel(
                                 label: Some("onyx-graph-wave-encoder"),
                             },
                         );
-                        let mut pipeline_cache = pipelines_ref.clone();
+                        let mut pipeline_cache = triangle_pipelines_ref.clone();
                         for pass in chunk {
                             encode_pass(
                                 renderer,
                                 &mut encoder,
                                 pass,
-                                &targets_ref[pass.target_index],
+                                targets_ref,
+                                context_ref,
                                 &mut pipeline_cache,
                             );
                         }
@@ -534,6 +663,7 @@ mod tests {
     use super::*;
     use crate::graph::RenderGraphNode;
     use crate::offscreen::linear_to_srgb8;
+    use crate::resources::srgb8_to_linear;
     use crate::RendererConfig;
 
     fn node(
@@ -702,12 +832,233 @@ mod tests {
         }
     }
 
-    /// A mixed graph: three independent targets plus a conflicting-writer
-    /// pair (`scene_clear` then `clear_over` on "scene" — declaration order
-    /// must survive parallel execution). Target "a" is 4× MSAA.
+    #[test]
+    fn sampling_pass_round_trips_source_pixels_exactly() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'draw' renders the triangle into "scene"; 'blit' reads
+                // "scene" and draws it onto "post" (white tint, full window).
+                let graph = &graph(&[
+                    node("draw", &[], &["scene"]),
+                    node("blit", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 16, 16),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "draw" => Some(PassKind::Triangle {
+                        triangle: [1.0, 0.5, 0.0, 1.0],
+                        background: [0.05, 0.1, 0.15, 1.0],
+                    }),
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(frames.len(), 2);
+                assert_eq!(frames[0].0, "scene");
+                assert_eq!(frames[1].0, "post");
+                assert_eq!(
+                    frames[1].1.pixels, frames[0].1.pixels,
+                    "nearest + full window + white tint is a pixel-exact copy"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sampling_quad_uv_window_selects_source_region() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'paint' fills "scene" with four quadrant colors as 8×8
+                // blocks (via clears won by declaration order), then 'blit'
+                // draws the bottom-right quadrant stretched over "post".
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("blit", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 16, 16),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    // The source content doesn't matter: the assertion below
+                    // checks the uv mapping against whatever "scene" holds
+                    // (a full-screen triangle over black here).
+                    "paint" => Some(PassKind::Triangle {
+                        triangle: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.5, 0.5, 0.5, 0.5],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let scene = &frames[0].1;
+                let post = &frames[1].1;
+                // Pixel (x, y) of "post" samples texel (8 + x/2, 8 + y/2) of
+                // "scene" — the bottom-right quadrant stretched to full size.
+                for y in 0..16u32 {
+                    for x in 0..16u32 {
+                        let src = ((8 + y / 2) * 16 + 8 + x / 2) as usize * 4;
+                        let dst = ((y * 16 + x) * 4) as usize;
+                        assert_eq!(
+                            &post.pixels[dst..dst + 4],
+                            &scene.pixels[src..src + 4],
+                            "pixel ({x}, {y}) must sample the quadrant texel"
+                        );
+                    }
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sampling_quad_tint_multiplies_in_linear_space() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // A solid "scene" (full-screen triangle over a clear of the
+                // same color), tinted non-trivially by 'blit'.
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("blit", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let solid = [0.9, 0.6, 0.3, 1.0];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear(solid)),
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 0.5, 0.25, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let source_bytes: Vec<u8> = frames[0]
+                    .1
+                    .pixels
+                    .chunks_exact(4)
+                    .flat_map(|p| [p[0], p[1], p[2], p[3]])
+                    .collect();
+                let expected = [
+                    linear_to_srgb8(srgb8_to_linear(source_bytes[0])),
+                    linear_to_srgb8(srgb8_to_linear(source_bytes[1]) * 0.5),
+                    linear_to_srgb8(srgb8_to_linear(source_bytes[2]) * 0.25),
+                    source_bytes[3],
+                ];
+                for chunk in frames[1].1.pixels.chunks_exact(4) {
+                    // ×1.0 and alpha are bit-exact; tinted channels allow
+                    // ±1 LSB (GPU encodes in f32, this model in f64).
+                    for k in 0..4 {
+                        let tolerance = if k == 1 || k == 2 { 1 } else { 0 };
+                        assert!(
+                            (i32::from(chunk[k]) - i32::from(expected[k])).abs() <= tolerance,
+                            "tint applies in linear space: pixel {chunk:?} vs {expected:?}"
+                        );
+                    }
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sampling_rejects_multisampled_source_or_target() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.0, 0.0, 0.0, 1.0])),
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                // MSAA source.
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("blit", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::with_samples("scene", 16, 16, 4),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("source");
+                assert!(
+                    error.to_string().contains("single-sample"),
+                    "source error must explain the constraint: {error}"
+                );
+                // MSAA target.
+                let resources = [
+                    ResourceSpec::new("scene", 16, 16),
+                    ResourceSpec::with_samples("post", 16, 16, 4),
+                ];
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("target");
+                assert!(
+                    error.to_string().contains("single-sample"),
+                    "target error must explain the constraint: {error}"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sampling_with_wrong_read_count_is_rejected() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // A Clear that reads (should read nothing).
+                let graph = &graph(&[node("bad", &["scene"], &["post"])]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "bad" => Some(PassKind::Clear([0.0, 0.0, 0.0, 1.0])),
+                    _ => None,
+                };
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("reads");
+                assert!(
+                    error.to_string().contains("must read"),
+                    "error must explain the read contract: {error}"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// A mixed graph: three independent targets, a conflicting-writer pair
+    /// (`scene_clear` then `clear_over` on "scene" — declaration order must
+    /// survive parallel execution), a 4× MSAA target, and a sampling node
+    /// two waves after its producer.
     fn mixed_graph() -> (
         RenderGraph,
-        [ResourceSpec; 4],
+        [ResourceSpec; 5],
         impl Fn(&str) -> Option<PassKind>,
     ) {
         let graph = graph(&[
@@ -716,12 +1067,14 @@ mod tests {
             node("tri_b", &[], &["b"]),
             node("clear_over", &[], &["scene"]),
             node("clear_c", &[], &["c"]),
+            node("blit", &["scene"], &["d"]),
         ]);
         let resources = [
             ResourceSpec::new("scene", 16, 16),
             ResourceSpec::with_samples("a", 16, 16, 4),
             ResourceSpec::new("b", 16, 16),
             ResourceSpec::new("c", 16, 16),
+            ResourceSpec::new("d", 16, 16),
         ];
         let kinds = move |name: &str| match name {
             "scene_clear" => Some(PassKind::Clear([0.1, 0.2, 0.3, 1.0])),
@@ -734,6 +1087,11 @@ mod tests {
             "tri_b" => Some(PassKind::Triangle {
                 triangle: [0.2, 0.4, 1.0, 1.0],
                 background: [0.5, 0.0, 0.5, 1.0],
+            }),
+            "blit" => Some(PassKind::TexturedQuad {
+                tint: [1.0, 1.0, 1.0, 1.0],
+                background: [0.0, 0.0, 0.0, 1.0],
+                uv_window: [0.0, 0.0, 1.0, 1.0],
             }),
             _ => None,
         };
@@ -780,6 +1138,9 @@ mod tests {
                         255
                     ]
                 );
+                // "d" is the sampling copy of "scene" — same bytes in the
+                // parallel run, proving cross-wave read-after-write.
+                assert_eq!(parallel[4].1.pixels, parallel[0].1.pixels);
             }
             Err(RenderError::NoAdapter { .. }) => {}
             Err(other) => panic!("unexpected renderer error: {other}"),
