@@ -34,6 +34,15 @@
 //! "scene" draws "scene" onto "post". This increment requires single-sample
 //! resources on both ends of a sampling pass; an MSAA quad pipeline and
 //! multi-target passes land later.
+//!
+//! The executor is format-agnostic ([`ResourceSpec::format`]): pipelines are
+//! built per (sample count, format) and BGRA readbacks are swizzled back to
+//! RGBA, so [`OffscreenFrame`] stays RGBA-ordered for every target. One
+//! target may also be caller-provided ([`ExternalTarget`],
+//! [`execute_with_external_target`]) — that is the swapchain frame for
+//! windowed rendering: validated against its declaration, drawn into like
+//! any other target, never allocated, sampled or read back; the caller
+//! presents it.
 
 use crate::graph::{GraphError, RenderGraph};
 use crate::offscreen::{readback_texture, OffscreenFrame};
@@ -81,10 +90,13 @@ pub struct ResourceSpec {
     /// MSAA sample count for this target: `1` renders directly, `> 1` draws
     /// into a multisampled attachment that resolves into the readback texture.
     pub samples: u32,
+    /// Pixel format of the target. The executor is format-agnostic: pipelines
+    /// are built per format, and BGRA readbacks are swizzled back to RGBA.
+    pub format: wgpu::TextureFormat,
 }
 
 impl ResourceSpec {
-    /// A single-sample target — the common case.
+    /// A single-sample sRGB target — the common case.
     #[must_use]
     pub const fn new(name: &'static str, width: u32, height: u32) -> Self {
         Self {
@@ -92,6 +104,7 @@ impl ResourceSpec {
             width,
             height,
             samples: 1,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
         }
     }
 
@@ -103,8 +116,45 @@ impl ResourceSpec {
             width,
             height,
             samples,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
         }
     }
+
+    /// A target with an explicit format (single-sample). Use this for
+    /// non-sRGB or BGRA targets — e.g. matching a swapchain format.
+    #[must_use]
+    pub const fn with_format(
+        name: &'static str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            name,
+            width,
+            height,
+            samples: 1,
+            format,
+        }
+    }
+}
+
+/// A target the caller provides instead of the executor allocating it —
+/// currently the swapchain frame for windowed rendering
+/// ([`crate::surface::SurfaceRenderer::render_to_surface`]). The executor
+/// draws into its view like any other declared target, but never allocates,
+/// samples or reads it back; the caller owns acquisition and present.
+pub struct ExternalTarget {
+    /// The declared resource name this target stands in for.
+    pub name: &'static str,
+    /// The caller-provided texture (e.g. the current swapchain frame).
+    pub texture: wgpu::Texture,
+    /// The texture's format — must match the declared [`ResourceSpec::format`].
+    pub format: wgpu::TextureFormat,
+    /// Texture width — must match the declared [`ResourceSpec::width`].
+    pub width: u32,
+    /// Texture height — must match the declared [`ResourceSpec::height`].
+    pub height: u32,
 }
 
 /// One validated node: its pass kind, the target it writes and — for
@@ -130,27 +180,48 @@ struct Target {
     /// `Some` when `samples > 1`: the multisampled attachment views.
     msaa_view: Option<wgpu::TextureView>,
     samples: u32,
+    format: wgpu::TextureFormat,
 }
 
 /// Resources shared by every pass encoding of one execution — built once on
 /// the calling thread, shared across worker threads (`RenderPipeline`,
-/// `BindGroupLayout` and `Sampler` are all `Send + Sync`).
+/// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad pipeline
+/// is built per target format up front so encoding threads only look up.
 struct PassEncoderContext {
-    quad_pipeline: wgpu::RenderPipeline,
+    quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     quad_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
 impl PassEncoderContext {
-    fn new(renderer: &Renderer) -> Self {
+    /// Build the quad pipeline for every distinct `formats` entry (the target
+    /// formats of this execution's sampling passes).
+    fn new(renderer: &Renderer, formats: impl Iterator<Item = wgpu::TextureFormat>) -> Self {
+        let mut quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)> = Vec::new();
+        for format in formats {
+            if !quad_pipelines
+                .iter()
+                .any(|(existing, _)| *existing == format)
+            {
+                let built = resources::create_quad_pipeline(renderer, format);
+                quad_pipelines.push((format, built));
+            }
+        }
         Self {
-            quad_pipeline: resources::create_quad_pipeline(
-                renderer,
-                wgpu::TextureFormat::Rgba8UnormSrgb,
-            ),
+            quad_pipelines,
             quad_layout: resources::create_quad_bind_layout(renderer),
             sampler: resources::create_sampler(renderer, true),
         }
+    }
+
+    /// The quad pipeline for `format` (built during [`Self::new`]).
+    fn quad_pipeline(&self, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        &self
+            .quad_pipelines
+            .iter()
+            .find(|(existing, _)| *existing == format)
+            .expect("quad pipeline prebuilt for every sampling format")
+            .1
     }
 }
 
@@ -285,15 +356,36 @@ fn plan_wave(
         .collect()
 }
 
-/// Allocate every declared resource. Targets with `samples > 1` get a
-/// multisampled attachment alongside the single-sample resolve texture; the
-/// single-sample texture carries `TEXTURE_BINDING` so sampling passes can
+/// Allocate every declared resource (or splice in the caller-provided
+/// [`ExternalTarget`] in its declared position). Targets with `samples > 1`
+/// get a multisampled attachment alongside the single-sample resolve texture;
+/// the single-sample texture carries `TEXTURE_BINDING` so sampling passes can
 /// bind it.
-fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Target> {
+fn allocate_targets(
+    renderer: &Renderer,
+    resources: &[ResourceSpec],
+    external: Option<&ExternalTarget>,
+) -> Vec<Target> {
     let device = &renderer.device;
     resources
         .iter()
         .map(|spec| {
+            if let Some(external) = external.filter(|external| external.name == spec.name) {
+                let view = external.texture.create_view(&wgpu::TextureViewDescriptor {
+                    label: Some("onyx-graph-external-view"),
+                    ..wgpu::TextureViewDescriptor::default()
+                });
+                return Target {
+                    name: spec.name,
+                    width: external.width,
+                    height: external.height,
+                    texture: external.texture.clone(),
+                    view,
+                    msaa_view: None,
+                    samples: 1,
+                    format: external.format,
+                };
+            }
             let extent = wgpu::Extent3d {
                 width: spec.width,
                 height: spec.height,
@@ -305,7 +397,7 @@ fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Targ
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: spec.format,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                     | wgpu::TextureUsages::COPY_SRC
                     | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -319,7 +411,7 @@ fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Targ
                     mip_level_count: 1,
                     sample_count: spec.samples,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    format: spec.format,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
@@ -335,20 +427,88 @@ fn allocate_targets(renderer: &Renderer, resources: &[ResourceSpec]) -> Vec<Targ
                 view,
                 msaa_view,
                 samples: spec.samples,
+                format: spec.format,
             }
         })
         .collect()
 }
 
-/// The triangle pipeline for `samples` — the plain pipeline at 1×, the MSAA
-/// variant otherwise. Cached per sample count.
+/// Validate the external target against its declared [`ResourceSpec`] before
+/// any GPU work: it must be declared, single-sample, format- and
+/// size-matched, and must not be sampled (swapchain textures carry only the
+/// render-attachment usage).
+fn validate_external(
+    resources: &[ResourceSpec],
+    planned: &[PlannedPass],
+    external: &ExternalTarget,
+) -> Result<(), RenderError> {
+    let Some(spec) = resources.iter().find(|spec| spec.name == external.name) else {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "external target '{}' is not a declared resource",
+                external.name
+            ),
+        });
+    };
+    if spec.samples != 1 {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "external target '{}' must be single-sample, declared {}x MSAA",
+                external.name, spec.samples
+            ),
+        });
+    }
+    if spec.format != external.format {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "external target '{}' format mismatch: declared {:?}, provided {:?}",
+                external.name, spec.format, external.format
+            ),
+        });
+    }
+    if spec.width != external.width || spec.height != external.height {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "external target '{}' size mismatch: declared {}x{}, provided {}x{}",
+                external.name, spec.width, spec.height, external.width, external.height
+            ),
+        });
+    }
+    if planned
+        .iter()
+        .any(|pass| pass.read_index == Some(spec_index(resources, external.name)))
+    {
+        return Err(RenderError::Unsupported {
+            message: format!(
+                "external target '{}' cannot be sampled; blit through an \
+                 intermediate target instead",
+                external.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The declared index of resource `name` (validated callers only).
+fn spec_index(resources: &[ResourceSpec], name: &str) -> usize {
+    resources
+        .iter()
+        .position(|spec| spec.name == name)
+        .expect("validated callers ensure the resource is declared")
+}
+
+/// The triangle pipeline for `(samples, format)` — the plain pipeline at 1×,
+/// the MSAA variant otherwise. Cached per sample count and format.
 fn triangle_pipeline_for(
     renderer: &Renderer,
     format: wgpu::TextureFormat,
     samples: u32,
-    cache: &mut Vec<(u32, wgpu::RenderPipeline)>,
+    cache: &mut Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
 ) -> wgpu::RenderPipeline {
-    if let Some((_, existing)) = cache.iter().find(|(count, _)| *count == samples) {
+    if let Some((_, existing)) = cache
+        .iter()
+        .find(|((count, cached_format), _)| *count == samples && *cached_format == format)
+    {
         return existing.clone();
     }
     let built = if samples <= 1 {
@@ -356,7 +516,7 @@ fn triangle_pipeline_for(
     } else {
         resources::create_triangle_pipeline_msaa(renderer, format, samples)
     };
-    cache.push((samples, built.clone()));
+    cache.push(((samples, format), built.clone()));
     built
 }
 
@@ -369,7 +529,7 @@ fn encode_pass(
     pass: &PlannedPass,
     targets: &[Target],
     context: &PassEncoderContext,
-    triangle_pipelines: &mut Vec<(u32, wgpu::RenderPipeline)>,
+    triangle_pipelines: &mut Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
 ) {
     let target = &targets[pass.target_index];
     let attachment_view = target.msaa_view.as_ref().unwrap_or(&target.view);
@@ -422,12 +582,8 @@ fn encode_pass(
                 color_attachments: &[Some(attachment)],
                 ..wgpu::RenderPassDescriptor::default()
             });
-            let pipeline = triangle_pipeline_for(
-                renderer,
-                wgpu::TextureFormat::Rgba8UnormSrgb,
-                target.samples,
-                triangle_pipelines,
-            );
+            let pipeline =
+                triangle_pipeline_for(renderer, target.format, target.samples, triangle_pipelines);
             pass_handle.set_pipeline(&pipeline);
             pass_handle.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass_handle.draw(0..3, 0..1);
@@ -484,21 +640,41 @@ fn encode_pass(
                 color_attachments: &[Some(attachment)],
                 ..wgpu::RenderPassDescriptor::default()
             });
-            pass_handle.set_pipeline(&context.quad_pipeline);
+            pass_handle.set_pipeline(context.quad_pipeline(target.format));
             pass_handle.set_bind_group(0, &bind_group, &[]);
             pass_handle.draw(0..6, 0..1);
         }
     }
 }
 
-/// Read back every target in resource declaration order.
+/// `true` for BGRA storage — readback bytes need an R/B channel swap so
+/// [`OffscreenFrame`] stays RGBA-ordered regardless of target format.
+fn is_bgra(format: wgpu::TextureFormat) -> bool {
+    matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    )
+}
+
+/// Read back every target in resource declaration order (except
+/// `skip`, the external target the caller presents themselves). BGRA
+/// targets are swizzled back to RGBA byte order.
 fn readback_targets(
     renderer: &Renderer,
     targets: &[Target],
+    skip: Option<&str>,
 ) -> Result<Vec<(&'static str, OffscreenFrame)>, RenderError> {
     let mut frames = Vec::with_capacity(targets.len());
     for target in targets {
-        let pixels = readback_texture(renderer, &target.texture, target.width, target.height)?;
+        if skip == Some(target.name) {
+            continue;
+        }
+        let mut pixels = readback_texture(renderer, &target.texture, target.width, target.height)?;
+        if is_bgra(target.format) {
+            for channel in pixels.chunks_exact_mut(4) {
+                channel.swap(0, 2);
+            }
+        }
         frames.push((
             target.name,
             OffscreenFrame {
@@ -526,6 +702,37 @@ pub fn execute_offscreen(
     resources: &[ResourceSpec],
     kind_of: &dyn Fn(&str) -> Option<PassKind>,
 ) -> Result<Vec<(&'static str, OffscreenFrame)>, RenderError> {
+    execute_sequential(renderer, graph, resources, kind_of, None)
+}
+
+/// Execute `graph` sequentially with one caller-provided target — the
+/// swapchain frame for windowed rendering. The external target is validated
+/// against its declaration, drawn into like any other target, but neither
+/// allocated, sampled nor read back; the caller presents it.
+///
+/// # Errors
+/// Same as [`execute_offscreen`], plus [`RenderError::Unsupported`] when the
+/// external target mismatches its declaration or a sampling pass tries to
+/// read it.
+pub fn execute_with_external_target(
+    renderer: &Renderer,
+    graph: &RenderGraph,
+    resources: &[ResourceSpec],
+    kind_of: &dyn Fn(&str) -> Option<PassKind>,
+    external: &ExternalTarget,
+) -> Result<Vec<(&'static str, OffscreenFrame)>, RenderError> {
+    execute_sequential(renderer, graph, resources, kind_of, Some(external))
+}
+
+/// The sequential body shared by [`execute_offscreen`] and
+/// [`execute_with_external_target`].
+fn execute_sequential(
+    renderer: &Renderer,
+    graph: &RenderGraph,
+    resources: &[ResourceSpec],
+    kind_of: &dyn Fn(&str) -> Option<PassKind>,
+    external: Option<&ExternalTarget>,
+) -> Result<Vec<(&'static str, OffscreenFrame)>, RenderError> {
     let waves = graph
         .execution_waves()
         .map_err(|error: GraphError| RenderError::Graph {
@@ -535,8 +742,15 @@ pub fn execute_offscreen(
     for wave in &waves {
         planned.extend(plan_wave(renderer, graph, resources, kind_of, wave)?);
     }
-    let targets = allocate_targets(renderer, resources);
-    let context = PassEncoderContext::new(renderer);
+    if let Some(external) = external {
+        validate_external(resources, &planned, external)?;
+    }
+    let targets = allocate_targets(renderer, resources, external);
+    let quad_formats = planned
+        .iter()
+        .filter(|pass| matches!(pass.kind, PassKind::TexturedQuad { .. }))
+        .map(|pass| targets[pass.target_index].format);
+    let context = PassEncoderContext::new(renderer, quad_formats);
     let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
@@ -554,7 +768,7 @@ pub fn execute_offscreen(
         );
     }
     renderer.queue.submit([encoder.finish()]);
-    readback_targets(renderer, &targets)
+    readback_targets(renderer, &targets, external.map(|external| external.name))
 }
 
 /// Execute `graph` offscreen in parallel: waves of independent nodes encode
@@ -588,34 +802,31 @@ pub fn execute_offscreen_parallel(
         .map(|wave| plan_wave(renderer, graph, resources, kind_of, wave))
         .collect::<Result<Vec<Vec<PlannedPass>>, RenderError>>()?;
 
-    let targets = allocate_targets(renderer, resources);
-    let context = PassEncoderContext::new(renderer);
+    let targets = allocate_targets(renderer, resources, None);
+    let quad_formats = planned
+        .iter()
+        .flatten()
+        .filter(|pass| matches!(pass.kind, PassKind::TexturedQuad { .. }))
+        .map(|pass| targets[pass.target_index].format);
+    let context = PassEncoderContext::new(renderer, quad_formats);
     let workers = workers.max(1);
 
     for wave in &planned {
         // Prebuild the triangle pipelines this wave needs —
         // RenderPipeline is Send + Sync, so threads can share them.
-        let mut triangle_pipelines: Vec<(u32, wgpu::RenderPipeline)> = Vec::new();
+        let mut triangle_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)> =
+            Vec::new();
         for pass in wave {
             if matches!(pass.kind, PassKind::Triangle { .. }) {
-                let target_samples = targets[pass.target_index].samples;
-                if !triangle_pipelines
-                    .iter()
-                    .any(|(count, _)| *count == target_samples)
-                {
-                    let built = if target_samples <= 1 {
-                        pipeline::create_triangle_pipeline(
-                            renderer,
-                            wgpu::TextureFormat::Rgba8UnormSrgb,
-                        )
+                let target = &targets[pass.target_index];
+                let key = (target.samples, target.format);
+                if !triangle_pipelines.iter().any(|(cached, _)| *cached == key) {
+                    let built = if key.0 <= 1 {
+                        pipeline::create_triangle_pipeline(renderer, key.1)
                     } else {
-                        resources::create_triangle_pipeline_msaa(
-                            renderer,
-                            wgpu::TextureFormat::Rgba8UnormSrgb,
-                            target_samples,
-                        )
+                        resources::create_triangle_pipeline_msaa(renderer, key.1, key.0)
                     };
-                    triangle_pipelines.push((target_samples, built));
+                    triangle_pipelines.push((key, built));
                 }
             }
         }
@@ -655,7 +866,7 @@ pub fn execute_offscreen_parallel(
         renderer.queue.submit(command_buffers);
     }
 
-    readback_targets(renderer, &targets)
+    readback_targets(renderer, &targets, None)
 }
 
 #[cfg(test)]
@@ -1198,6 +1409,300 @@ mod tests {
                         assert_eq!(chunk, &expected, "target {index} must match its color");
                     }
                 }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// Byte value of linear `value` under the `*Unorm` (non-sRGB) encoding:
+    /// the GPU maps [0, 1] linearly onto [0, 255].
+    fn linear8(value: f64) -> u8 {
+        (value * 255.0).round().clamp(0.0, 255.0) as u8
+    }
+
+    #[test]
+    fn linear_target_uses_unorm_encoding() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // A clear on a non-sRGB target must store the linear value
+                // directly (round(f * 255)), NOT through the sRGB curve.
+                let graph = &graph(&[node("clear", &[], &["t"])]);
+                let resources = [ResourceSpec::with_format(
+                    "t",
+                    8,
+                    8,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                )];
+                let kinds = |name: &str| match name {
+                    "clear" => Some(PassKind::Clear([0.5, 0.25, 1.0, 1.0])),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let expected = [linear8(0.5), linear8(0.25), linear8(1.0), 255];
+                for chunk in frames[0].1.pixels.chunks_exact(4) {
+                    assert_eq!(chunk, &expected, "Unorm encoding must be linear");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn bgra_readback_swizzles_to_rgba() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // BGRA stores (b, g, r, a); the readback must restore RGBA
+                // order so OffscreenFrame stays RGBA-ordered.
+                let graph = &graph(&[node("clear", &[], &["t"])]);
+                let resources = [ResourceSpec::with_format(
+                    "t",
+                    8,
+                    8,
+                    wgpu::TextureFormat::Bgra8UnormSrgb,
+                )];
+                let kinds = |name: &str| match name {
+                    "clear" => Some(PassKind::Clear([1.0, 0.0, 0.5, 1.0])),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let expected = [
+                    linear_to_srgb8(1.0),
+                    linear_to_srgb8(0.0),
+                    linear_to_srgb8(0.5),
+                    255,
+                ];
+                for chunk in frames[0].1.pixels.chunks_exact(4) {
+                    assert_eq!(chunk, &expected, "readback must be RGBA-ordered");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn mixed_format_graph_matches_parallel() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("srgb_clear", &[], &["srgb"]),
+                    node("linear_tri", &[], &["linear"]),
+                    node("bgra_clear", &[], &["bgra"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("srgb", 8, 8),
+                    ResourceSpec::with_format("linear", 8, 8, wgpu::TextureFormat::Rgba8Unorm),
+                    ResourceSpec::with_format("bgra", 8, 8, wgpu::TextureFormat::Bgra8UnormSrgb),
+                ];
+                let kinds = |name: &str| match name {
+                    "srgb_clear" => Some(PassKind::Clear([0.1, 0.2, 0.3, 1.0])),
+                    "linear_tri" => Some(PassKind::Triangle {
+                        triangle: [1.0, 0.5, 0.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "bgra_clear" => Some(PassKind::Clear([0.4, 0.6, 0.8, 1.0])),
+                    _ => None,
+                };
+                let sequential =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("sequential");
+                let parallel = execute_offscreen_parallel(&renderer, graph, &resources, &kinds, 3)
+                    .expect("parallel");
+                for ((s_name, s_frame), (p_name, p_frame)) in sequential.iter().zip(&parallel) {
+                    assert_eq!(s_name, p_name);
+                    assert_eq!(s_frame.pixels, p_frame.pixels, "target '{s_name}'");
+                }
+                // The linear triangle target uses the Unorm contract.
+                let center = (4 * 8 + 4) * 4;
+                assert_eq!(
+                    &parallel[1].1.pixels[center..center + 4],
+                    &[linear8(1.0), linear8(0.5), linear8(0.0), 255]
+                );
+                // The BGRA target is swizzled back to RGBA in both runs.
+                assert_eq!(
+                    &parallel[2].1.pixels[0..4],
+                    &[
+                        linear_to_srgb8(0.4),
+                        linear_to_srgb8(0.6),
+                        linear_to_srgb8(0.8),
+                        255
+                    ]
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn external_backbuffer_renders_identically_and_skips_readback() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[node("tri", &[], &["swap"])]);
+                let resources = [ResourceSpec::new("swap", 16, 16)];
+                let kinds = |name: &str| match name {
+                    "tri" => Some(PassKind::Triangle {
+                        triangle: [1.0, 0.5, 0.0, 1.0],
+                        background: [0.1, 0.1, 0.1, 1.0],
+                    }),
+                    _ => None,
+                };
+                // The same graph, rendered into an allocated target:
+                let internal =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("internal");
+                // ... and into a caller-provided texture (swapchain-shaped):
+                let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("onyx-test-swapchain"),
+                    size: wgpu::Extent3d {
+                        width: 16,
+                        height: 16,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    // COPY_SRC so the test can verify the pixels — real
+                    // swapchain frames carry only RENDER_ATTACHMENT.
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                    view_formats: &[],
+                });
+                let external = ExternalTarget {
+                    name: "swap",
+                    texture: texture.clone(),
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    width: 16,
+                    height: 16,
+                };
+                let frames =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect("external");
+                // The external target is never read back...
+                assert!(frames.iter().all(|(name, _)| *name != "swap"));
+                // ...but its pixels match the internal render byte for byte:
+                let external_pixels =
+                    crate::offscreen::readback_texture(&renderer, &texture, 16, 16)
+                        .expect("external readback");
+                assert_eq!(external_pixels, internal[0].1.pixels);
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn external_backbuffer_validates_against_its_declaration() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("onyx-test-swapchain"),
+                    size: wgpu::Extent3d {
+                        width: 16,
+                        height: 16,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let external = ExternalTarget {
+                    name: "swap",
+                    texture: texture.clone(),
+                    format: wgpu::TextureFormat::Bgra8UnormSrgb,
+                    width: 16,
+                    height: 16,
+                };
+                let kinds = |name: &str| match name {
+                    "clear" => Some(PassKind::Clear([0.0, 0.0, 0.0, 1.0])),
+                    _ => None,
+                };
+                // Undeclared resource.
+                let graph = &graph(&[node("clear", &[], &["swap"])]);
+                let resources: [ResourceSpec; 1] = [ResourceSpec::new("other", 16, 16)];
+                let error =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect_err("undeclared");
+                assert!(error.to_string().contains("declared"), "{error}");
+                // Format mismatch.
+                let resources = [ResourceSpec::new("swap", 16, 16)];
+                let error =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect_err("format mismatch");
+                assert!(error.to_string().contains("format mismatch"), "{error}");
+                // Size mismatch.
+                let external = ExternalTarget {
+                    name: "swap",
+                    texture,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    width: 32,
+                    height: 32,
+                };
+                let error =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect_err("size mismatch");
+                assert!(error.to_string().contains("size mismatch"), "{error}");
+                // MSAA declaration.
+                let resources = [ResourceSpec::with_samples("swap", 16, 16, 4)];
+                let error =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect_err("msaa");
+                assert!(error.to_string().contains("single-sample"), "{error}");
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sampling_the_external_backbuffer_is_rejected() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // A TexturedQuad that reads the swapchain target has no
+                // sampleable source — rejected before encoding.
+                let graph = &graph(&[node("blit", &["swap"], &["post"])]);
+                let resources = [
+                    ResourceSpec::new("swap", 16, 16),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("onyx-test-swapchain"),
+                    size: wgpu::Extent3d {
+                        width: 16,
+                        height: 16,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let external = ExternalTarget {
+                    name: "swap",
+                    texture,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    width: 16,
+                    height: 16,
+                };
+                let error =
+                    execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
+                        .expect_err("sampling");
+                assert!(error.to_string().contains("cannot be sampled"), "{error}");
             }
             Err(RenderError::NoAdapter { .. }) => {}
             Err(other) => panic!("unexpected renderer error: {other}"),

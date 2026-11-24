@@ -43,6 +43,12 @@ pub enum RenderError {
         /// What is unsupported and what replaces it.
         message: String,
     },
+    /// A swapchain operation failed: surface creation, configuration,
+    /// format/mode negotiation or frame acquisition.
+    Surface {
+        /// Surface error text from wgpu.
+        message: String,
+    },
 }
 
 impl fmt::Display for RenderError {
@@ -54,6 +60,7 @@ impl fmt::Display for RenderError {
             Self::Map { message } => write!(f, "readback map failed: {message}"),
             Self::Graph { message } => write!(f, "render graph error: {message}"),
             Self::Unsupported { message } => write!(f, "unsupported: {message}"),
+            Self::Surface { message } => write!(f, "surface/swapchain error: {message}"),
         }
     }
 }

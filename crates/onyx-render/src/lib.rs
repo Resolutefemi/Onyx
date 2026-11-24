@@ -61,8 +61,23 @@
 //!   passes; wgpu inserts the render-attachment → texture-binding barrier
 //!   automatically.
 //!
-//! Still ahead in M2: surfaces and present, forward PBR, the 2D suite and
-//! the post-processing stack.
+//! M2 (sixth increment) wires the executor to a real window:
+//!
+//! - [`executor::ResourceSpec::format`] — the executor is format-agnostic:
+//!   pipelines are built per (sample count, format), BGRA readbacks are
+//!   swizzled back to RGBA and linear (`*Unorm`) targets have their own
+//!   byte-exact contract,
+//! - [`executor::ExternalTarget`] +
+//!   [`executor::execute_with_external_target`] — one declared target can be
+//!   caller-provided (the swapchain frame): validated against its
+//!   declaration, drawn into like any other target, never allocated, sampled
+//!   or read back,
+//! - [`surface`] — the deterministic swapchain policy (sRGB format, Fifo
+//!   vsync) and [`surface::SurfaceRenderer`]: acquire → render the
+//!   `backbuffer` node onto the swapchain → present.
+//!
+//! Still ahead in M2: forward PBR, the 2D suite and the post-processing
+//! stack.
 
 pub mod executor;
 pub mod graph;
@@ -70,6 +85,7 @@ pub mod offscreen;
 pub mod pipeline;
 pub mod renderer;
 pub mod resources;
+pub mod surface;
 
 /// Physical graphics backend targeted by the hardware abstraction layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
