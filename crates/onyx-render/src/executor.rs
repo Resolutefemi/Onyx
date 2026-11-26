@@ -41,6 +41,12 @@
 //! exactly-rounded IEEE f32 operations), so tests compare the GPU output
 //! against the mirror byte for byte.
 //!
+//! Sprite passes ([`PassKind::Sprites2d`], [`crate::sprite`]) batch any
+//! number of 2D sprites — destination rects, uv windows, linear tints —
+//! from the node's declared read resource into one draw call, in submission
+//! order, under the 1:1 viewport camera whose projection the CPU mirror
+//! [`crate::sprite::Camera2d::project`] reproduces bit for bit.
+//!
 //! The executor is format-agnostic ([`ResourceSpec::format`]): pipelines are
 //! built per (sample count, format) and BGRA readbacks are swizzled back to
 //! RGBA, so [`OffscreenFrame`] stays RGBA-ordered for every target. One
@@ -56,9 +62,10 @@ use crate::pbr;
 use crate::pipeline;
 use crate::renderer::{RenderError, Renderer};
 use crate::resources::{self, QuadUniform, QuadUniformBuffer};
+use crate::sprite;
 
-/// What a node renders.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// What a node renders. Not `Copy`: [`PassKind::Sprites2d`] owns its batch.
+#[derive(Debug, Clone, PartialEq)]
 pub enum PassKind {
     /// Clear the target to a color.
     Clear([f64; 4]),
@@ -103,6 +110,19 @@ pub enum PassKind {
         light_color: [f64; 3],
         /// Ambient term, linear, components in [0, 1].
         ambient: [f64; 3],
+    },
+    /// A batched 2D sprite pass ([`crate::sprite`]): draw any number of
+    /// sprites — destination rects, uv windows, linear tints — from the
+    /// node's declared read resource in one draw call, in submission order
+    /// (later sprites overwrite earlier ones; no blending in this
+    /// increment). Mirrors `bevy_sprite`'s batching and Godot's
+    /// `CanvasItem.draw_texture_rect`; the camera is the 1:1 viewport
+    /// camera (top-left origin, y down).
+    Sprites2d {
+        /// The sprite batch, drawn in order.
+        sprites: Vec<sprite::Sprite2d>,
+        /// Load-op clear color behind the batch.
+        background: [f64; 4],
     },
 }
 
@@ -187,7 +207,7 @@ pub struct ExternalTarget {
 
 /// One validated node: its pass kind, the target it writes and — for
 /// sampling passes — the target it reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 struct PlannedPass {
     node: &'static str,
     kind: PassKind,
@@ -214,25 +234,28 @@ struct Target {
 /// Resources shared by every pass encoding of one execution — built once on
 /// the calling thread, shared across worker threads (`RenderPipeline`,
 /// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad and PBR
-/// pipelines are built per needed format/(samples) up front so encoding
-/// threads only look up.
+/// and sprite pipelines are built per needed format/(samples) up front so
+/// encoding threads only look up.
 struct PassEncoderContext {
     quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     pbr_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
+    sprite_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     pbr_layout: wgpu::BindGroupLayout,
+    sprite_layout: wgpu::BindGroupLayout,
     quad_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
 impl PassEncoderContext {
     /// Build the quad pipeline for every distinct `quad_formats` entry (the
-    /// target formats of this execution's sampling passes) and the PBR
-    /// pipeline for every distinct `pbr_keys` entry — `(samples, format)` of
-    /// this execution's PBR passes.
+    /// target formats of this execution's sampling passes), and the PBR and
+    /// sprite pipelines for every distinct `(samples, format)` key of this
+    /// execution's PBR and sprite passes.
     fn new(
         renderer: &Renderer,
         quad_formats: impl Iterator<Item = wgpu::TextureFormat>,
         pbr_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
+        sprite_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
     ) -> Self {
         let mut quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)> = Vec::new();
         for format in quad_formats {
@@ -251,10 +274,23 @@ impl PassEncoderContext {
                 pbr_pipelines.push((key, built));
             }
         }
+        let mut sprite_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)> =
+            Vec::new();
+        for key in sprite_keys {
+            if !sprite_pipelines
+                .iter()
+                .any(|(existing, _)| *existing == key)
+            {
+                let built = sprite::create_sprite_pipeline(renderer, key.1, key.0);
+                sprite_pipelines.push((key, built));
+            }
+        }
         Self {
             quad_pipelines,
             pbr_pipelines,
+            sprite_pipelines,
             pbr_layout: pbr::create_pbr_bind_layout(renderer),
+            sprite_layout: sprite::create_sprite_bind_layout(renderer),
             quad_layout: resources::create_quad_bind_layout(renderer),
             sampler: resources::create_sampler(renderer, true),
         }
@@ -277,6 +313,17 @@ impl PassEncoderContext {
             .iter()
             .find(|(existing, _)| *existing == (samples, format))
             .expect("pbr pipeline prebuilt for every pbr (samples, format)")
+            .1
+    }
+
+    /// The sprite pipeline for `(samples, format)` (built during
+    /// [`Self::new`]).
+    fn sprite_pipeline(&self, samples: u32, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        &self
+            .sprite_pipelines
+            .iter()
+            .find(|(existing, _)| *existing == (samples, format))
+            .expect("sprite pipeline prebuilt for every sprite (samples, format)")
             .1
     }
 }
@@ -303,9 +350,10 @@ fn validate_sample_count(renderer: &Renderer, name: &str, samples: u32) -> Resul
 
 /// Validate one node and resolve its declarations into a [`PlannedPass`]:
 /// pass kind required, exactly one declared write target, and read
-/// declarations that match the pass kind (`Clear`/`Triangle` read nothing,
-/// `TexturedQuad` reads exactly one declared single-sample source). Runs
-/// before any GPU work so both executors reject bad graphs up front.
+/// declarations that match the pass kind (`Clear`/`Triangle`/`Pbr` read
+/// nothing, `TexturedQuad`/`Sprites2d` read exactly one declared
+/// single-sample source). Runs before any GPU work so both executors
+/// reject bad graphs up front.
 fn plan_node(
     renderer: &Renderer,
     graph: &RenderGraph,
@@ -325,7 +373,7 @@ fn plan_node(
         .expect("order names come from the graph");
     let reads_expected = match kind {
         PassKind::Clear(_) | PassKind::Triangle { .. } | PassKind::Pbr { .. } => 0,
-        PassKind::TexturedQuad { .. } => 1,
+        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } => 1,
     };
     if node.reads.len() != reads_expected {
         return Err(RenderError::Unsupported {
@@ -337,6 +385,7 @@ fn plan_node(
                     PassKind::Triangle { .. } => "Triangle",
                     PassKind::TexturedQuad { .. } => "TexturedQuad",
                     PassKind::Pbr { .. } => "Pbr",
+                    PassKind::Sprites2d { .. } => "Sprites2d",
                 },
                 reads_expected,
                 node.reads.len()
@@ -370,25 +419,26 @@ fn plan_node(
         light_dir,
         light_color,
         ambient,
-    } = kind
+    } = &kind
     {
         pbr::validate_pbr_params(
             node_name,
-            albedo,
-            roughness,
-            metallic,
-            light_dir,
-            light_color,
-            ambient,
+            *albedo,
+            *roughness,
+            *metallic,
+            *light_dir,
+            *light_color,
+            *ambient,
         )?;
     }
 
     // A sampling pass reads a texture: the source must be a declared
-    // single-sample target (multisampled textures are not sampleable by this
-    // pipeline), and this increment draws the quad only into single-sample
-    // targets.
+    // single-sample target (multisampled textures are not sampleable by
+    // these pipelines). The quad draws only into single-sample targets; the
+    // sprite pass has per-(samples, format) pipelines and renders MSAA
+    // targets through the resolve machinery.
     let read_index = match kind {
-        PassKind::TexturedQuad { .. } => {
+        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } => {
             let source = node.reads[0];
             let index = resources
                 .iter()
@@ -397,11 +447,20 @@ fn plan_node(
                     message: format!("node '{}' reads undeclared resource '{source}'", node.name),
                 })?;
             let source_samples = resources[index].samples;
-            if source_samples != 1 || resources[target_index].samples != 1 {
+            if source_samples != 1 {
                 return Err(RenderError::Unsupported {
                     message: format!(
                         "sampling pass '{}' requires single-sample resources: \
-                         source '{source}' is {source_samples}x, \
+                         source '{source}' is {source_samples}x",
+                        node.name
+                    ),
+                });
+            }
+            if matches!(kind, PassKind::TexturedQuad { .. }) && resources[target_index].samples != 1
+            {
+                return Err(RenderError::Unsupported {
+                    message: format!(
+                        "sampling pass '{}' requires single-sample resources: \
                          target '{written}' is {}x",
                         node.name, resources[target_index].samples
                     ),
@@ -610,7 +669,7 @@ fn encode_pass(
     let target = &targets[pass.target_index];
     let attachment_view = target.msaa_view.as_ref().unwrap_or(&target.view);
     let resolve_target = target.msaa_view.as_ref().map(|_| &target.view);
-    match pass.kind {
+    match &pass.kind {
         PassKind::Clear(color) => {
             let attachment = wgpu::RenderPassColorAttachment {
                 view: attachment_view,
@@ -638,7 +697,7 @@ fn encode_pass(
             triangle,
             background,
         } => {
-            let vertex_buffer = pipeline::triangle_vertex_buffer(renderer, triangle);
+            let vertex_buffer = pipeline::triangle_vertex_buffer(renderer, *triangle);
             let attachment = wgpu::RenderPassColorAttachment {
                 view: attachment_view,
                 depth_slice: None,
@@ -731,8 +790,14 @@ fn encode_pass(
             // Fixed camera-facing geometry — every dot product is uniform
             // (see `PbrParams::new`); each pass owns its uniform buffer and
             // bind group, like the sampling passes.
-            let params =
-                pbr::PbrParams::new(albedo, roughness, metallic, light_dir, light_color, ambient);
+            let params = pbr::PbrParams::new(
+                *albedo,
+                *roughness,
+                *metallic,
+                *light_dir,
+                *light_color,
+                *ambient,
+            );
             let uniform_buffer = pbr::PbrUniformBuffer::new(renderer, &params);
             let bind_group =
                 pbr::create_pbr_bind_group(renderer, &context.pbr_layout, &uniform_buffer);
@@ -758,6 +823,53 @@ fn encode_pass(
             pass_handle.set_pipeline(context.pbr_pipeline(target.samples, target.format));
             pass_handle.set_bind_group(0, &bind_group, &[]);
             pass_handle.draw(0..6, 0..1);
+        }
+        PassKind::Sprites2d {
+            sprites,
+            background,
+        } => {
+            // One batch, one draw call: the camera uniform comes from the
+            // target's dimensions (the 1:1 viewport camera), the vertices
+            // from the sprite list (CPU-side geometry, like Godot's canvas
+            // items), the texture from the declared read resource. Sprites
+            // draw in submission order — later sprites overwrite earlier
+            // ones (no blending in this increment).
+            let camera = sprite::Camera2d::new(target.width, target.height);
+            let camera_buffer = sprite::CameraUniformBuffer::new(renderer, &camera);
+            let read_index = pass.read_index.expect("Sprites2d plans a read");
+            let source_view = &targets[read_index].view;
+            let bind_group = sprite::create_sprite_bind_group(
+                renderer,
+                &context.sprite_layout,
+                &camera_buffer,
+                source_view,
+                &context.sampler,
+            );
+            let vertices = sprite::sprite_vertices(sprites);
+            let vertex_buffer = sprite::SpriteVertexBuffer::new(renderer, &vertices);
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: background[0],
+                        g: background[1],
+                        b: background[2],
+                        a: background[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass_handle = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("onyx-graph-sprites"),
+                color_attachments: &[Some(attachment)],
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            pass_handle.set_pipeline(context.sprite_pipeline(target.samples, target.format));
+            pass_handle.set_bind_group(0, &bind_group, &[]);
+            pass_handle.set_vertex_buffer(0, vertex_buffer.buffer().slice(..));
+            pass_handle.draw(0..vertices.len() as u32, 0..1);
         }
     }
 }
@@ -872,7 +984,14 @@ fn execute_sequential(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys);
+    let sprite_keys = planned
+        .iter()
+        .filter(|pass| matches!(pass.kind, PassKind::Sprites2d { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys);
     let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
@@ -938,7 +1057,15 @@ pub fn execute_offscreen_parallel(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys);
+    let sprite_keys = planned
+        .iter()
+        .flatten()
+        .filter(|pass| matches!(pass.kind, PassKind::Sprites2d { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys);
     let workers = workers.max(1);
 
     for wave in &planned {
@@ -2177,7 +2304,7 @@ mod tests {
                     ),
                 ] {
                     let kinds = move |name: &str| match name {
-                        "chip" => Some(kind),
+                        "chip" => Some(kind.clone()),
                         _ => None,
                     };
                     let error = execute_offscreen(&renderer, base_graph, &resources, &kinds)
@@ -2186,12 +2313,344 @@ mod tests {
                 }
                 // Pbr reads nothing: a read declaration is a mismatch.
                 let kinds = |name: &str| match name {
-                    "chip" => Some(base),
+                    "chip" => Some(base.clone()),
                     _ => None,
                 };
                 let error = execute_offscreen(&renderer, reads_graph, &resources, &kinds)
                     .expect_err("reads");
                 assert!(error.to_string().contains("must read exactly 0"), "{error}");
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// The expected bytes of a solid source tinted by `tint`: sRGB decode →
+    /// linear tint multiply (per channel, in f64) → sRGB encode, like the
+    /// quad tint tests.
+    fn tinted_solid(source: [u8; 4], tint: [f64; 4]) -> [u8; 4] {
+        [
+            linear_to_srgb8(srgb8_to_linear(source[0]) * tint[0]),
+            linear_to_srgb8(srgb8_to_linear(source[1]) * tint[1]),
+            linear_to_srgb8(srgb8_to_linear(source[2]) * tint[2]),
+            linear_to_srgb8(srgb8_to_linear(source[3]) * tint[3]),
+        ]
+    }
+
+    /// Assert chunk vs expected with ±1 tolerance on the tinted channels
+    /// (the GPU encodes sRGB in f32, this model in f64) — ×1.0 channels and
+    /// alpha are bit-exact.
+    fn assert_tinted_chunk(chunk: &[u8], expected: [u8; 4], tint: [f64; 4]) {
+        for k in 0..4 {
+            let tolerance = if tint[k] != 1.0 { 1 } else { 0 };
+            assert!(
+                (i32::from(chunk[k]) - i32::from(expected[k])).abs() <= tolerance,
+                "channel {k}: {chunk:?} vs {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sprites_full_viewport_is_a_pixel_exact_copy() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 16, 16),
+                    ResourceSpec::new("hud", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.9, 0.6, 0.3, 1.0])),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d::full_viewport(16.0, 16.0)],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(
+                    frames[1].1.pixels, frames[0].1.pixels,
+                    "a full-viewport white-tint sprite is a pixel-exact copy"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_tinted_quadrant_matches_expectation() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // One sprite over the top-left quadrant, tinted in linear
+                // space; the rest of the target stays the background.
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 16, 16),
+                    ResourceSpec::new("hud", 16, 16),
+                ];
+                let solid = [0.9, 0.6, 0.3, 1.0];
+                let tint = [1.0, 0.5, 0.25, 1.0];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear(solid)),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 8.0, 8.0],
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                            tint,
+                        }],
+                        background: [0.05, 0.1, 0.15, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let source = [
+                    linear_to_srgb8(solid[0]),
+                    linear_to_srgb8(solid[1]),
+                    linear_to_srgb8(solid[2]),
+                    linear_to_srgb8(solid[3]),
+                ];
+                let expected = tinted_solid(source, tint);
+                let background = [
+                    linear_to_srgb8(0.05),
+                    linear_to_srgb8(0.1),
+                    linear_to_srgb8(0.15),
+                    linear_to_srgb8(1.0),
+                ];
+                for y in 0..16u32 {
+                    for x in 0..16u32 {
+                        let chunk = &frames[1].1.pixels
+                            [((y * 16 + x) * 4) as usize..((y * 16 + x) * 4 + 4) as usize];
+                        if x < 8 && y < 8 {
+                            assert_tinted_chunk(chunk, expected, tint);
+                        } else {
+                            assert_eq!(chunk, background);
+                        }
+                    }
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_batch_overdraw_last_sprite_wins() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // Two sprites over the same rect in one batch: the later
+                // sprite's tint wins everywhere (no blending).
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 16, 16),
+                    ResourceSpec::new("hud", 16, 16),
+                ];
+                let solid = [0.9, 0.6, 0.3, 1.0];
+                let second_tint = [0.5, 0.5, 0.5, 1.0];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear(solid)),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: vec![
+                            sprite::Sprite2d {
+                                rect: [0.0, 0.0, 16.0, 16.0],
+                                uv: [0.0, 0.0, 1.0, 1.0],
+                                tint: [1.0, 1.0, 1.0, 1.0],
+                            },
+                            sprite::Sprite2d {
+                                rect: [0.0, 0.0, 16.0, 16.0],
+                                uv: [0.0, 0.0, 1.0, 1.0],
+                                tint: second_tint,
+                            },
+                        ],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let source = [
+                    linear_to_srgb8(solid[0]),
+                    linear_to_srgb8(solid[1]),
+                    linear_to_srgb8(solid[2]),
+                    linear_to_srgb8(solid[3]),
+                ];
+                let expected = tinted_solid(source, second_tint);
+                for chunk in frames[1].1.pixels.chunks_exact(4) {
+                    assert_tinted_chunk(chunk, expected, second_tint);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_empty_batch_renders_the_background() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 8, 8),
+                    ResourceSpec::new("hud", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.5, 0.5, 0.5, 1.0])),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: Vec::new(),
+                        background: [0.25, 0.5, 0.75, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let expected = [
+                    linear_to_srgb8(0.25),
+                    linear_to_srgb8(0.5),
+                    linear_to_srgb8(0.75),
+                    linear_to_srgb8(1.0),
+                ];
+                for chunk in frames[1].1.pixels.chunks_exact(4) {
+                    assert_eq!(chunk, &expected);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_pass_supports_msaa_targets() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // The batch renders through a 4× MSAA attachment and
+                // resolves into the readback texture; a flat quad's samples
+                // are identical, so the resolve is the tinted texel.
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 8, 8),
+                    ResourceSpec::with_samples("hud", 8, 8, 4),
+                ];
+                let solid = [0.8, 0.5, 0.2, 1.0];
+                let tint = [1.0, 0.5, 0.5, 1.0];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear(solid)),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d::full_viewport(8.0, 8.0)],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let source = [
+                    linear_to_srgb8(solid[0]),
+                    linear_to_srgb8(solid[1]),
+                    linear_to_srgb8(solid[2]),
+                    linear_to_srgb8(solid[3]),
+                ];
+                let expected = tinted_solid(source, tint);
+                for chunk in frames[1].1.pixels.chunks_exact(4) {
+                    assert_tinted_chunk(chunk, expected, tint);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_parallel_matches_sequential() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'paint' fills "atlas" (wave 1); 'left' and 'right' each
+                // draw one sprite half (wave 2, parallel).
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("left", &["atlas"], &["a"]),
+                    node("right", &["atlas"], &["b"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("atlas", 8, 8),
+                    ResourceSpec::new("a", 8, 8),
+                    ResourceSpec::new("b", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.9, 0.6, 0.3, 1.0])),
+                    "left" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 4.0, 8.0],
+                            uv: [0.0, 0.0, 0.5, 1.0],
+                            tint: [1.0, 1.0, 1.0, 1.0],
+                        }],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "right" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [4.0, 0.0, 4.0, 8.0],
+                            uv: [0.5, 0.0, 0.5, 1.0],
+                            tint: [0.5, 0.5, 0.5, 1.0],
+                        }],
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let sequential =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("sequential");
+                let parallel = execute_offscreen_parallel(&renderer, graph, &resources, &kinds, 2)
+                    .expect("parallel");
+                for ((s_name, s_frame), (p_name, p_frame)) in sequential.iter().zip(&parallel) {
+                    assert_eq!(s_name, p_name);
+                    assert_eq!(s_frame.pixels, p_frame.pixels, "target '{s_name}'");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn sprites_reject_multisampled_source() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["atlas"]),
+                    node("sprites", &["atlas"], &["hud"]),
+                ]);
+                let resources = [
+                    ResourceSpec::with_samples("atlas", 16, 16, 4),
+                    ResourceSpec::new("hud", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.5, 0.5, 0.5, 1.0])),
+                    "sprites" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d::full_viewport(16.0, 16.0)],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("msaa");
+                assert!(
+                    error.to_string().contains("single-sample"),
+                    "source error must explain the constraint: {error}"
+                );
             }
             Err(RenderError::NoAdapter { .. }) => {}
             Err(other) => panic!("unexpected renderer error: {other}"),

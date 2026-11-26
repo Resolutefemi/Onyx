@@ -119,6 +119,8 @@
 
 ## 10. UI, HUD & Text System
 
+**Onyx UI Theme (binding):** every piece of Onyx-authored UI — editor, inspector, gizmos, HUD widget defaults, debug overlays and CLI output — is strict monochrome: white background (`#FFFFFF`), near-black foreground (`#0A0A0A`), grayscale-only hierarchy (no accent colors, no hues anywhere). Selection, state and emphasis are expressed through weight, shape and grayscale contrast, never color; lines are 1px hairlines at 1× DPI and typography stays a clean geometric sans on a fixed size grid. The only color in an Onyx session comes from the user's own content.
+
 **Layout Engine:** Flexbox & CSS-Grid layout engine (Taffy/Yoga), responsive anchoring, aspect-ratio containers, safe-area insets (mobile notches), scroll views, virtualized lists (for 10,000+ inventory items), drag-and-drop framework, DPI scaling.
 
 **Widget Library:** Button, Toggle, Checkbox, Radio, Slider, SpinBox, ProgressBar, TextInput (single/multi-line with IME), RichText (BBCode/Markdown inline icons & animations), Dropdown/ComboBox, TabContainer, TreeView, ColorPicker, Modal/Popup, Tooltip, ContextMenu, Minimap, Radial Wheel.

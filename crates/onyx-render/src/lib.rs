@@ -88,7 +88,21 @@
 //!   up front), renders into any target format and supports per-target
 //!   MSAA, and its output feeds sampling passes like any other resource.
 //!
-//! Still ahead in M2: the 2D suite and the post-processing stack.
+//! M2 (eighth increment) adds the 2D sprite suite:
+//!
+//! - [`sprite`] — batched 2D sprites, mirroring `bevy_sprite`'s batching
+//!   and Godot's `CanvasItem.draw_texture_rect`: `Sprite2d` (destination
+//!   rect, uv window, linear tint), the 1:1 viewport camera
+//!   [`sprite::Camera2d`] (top-left origin, y down) whose projection the
+//!   CPU mirror [`sprite::Camera2d::project`] reproduces bit for bit, and
+//!   one batch → one vertex buffer → one draw call,
+//! - [`executor::PassKind::Sprites2d`] — the sprite pass in the graph: it
+//!   reads one source texture, draws the batch in submission order (later
+//!   sprites overwrite earlier ones; no blending yet), renders any target
+//!   format including per-target MSAA, and a full-viewport white-tint
+//!   sprite is a pixel-exact copy of its source.
+//!
+//! Still ahead in M2: the post-processing stack.
 
 pub mod executor;
 pub mod graph;
@@ -97,6 +111,7 @@ pub mod pbr;
 pub mod pipeline;
 pub mod renderer;
 pub mod resources;
+pub mod sprite;
 pub mod surface;
 
 /// Physical graphics backend targeted by the hardware abstraction layer.
