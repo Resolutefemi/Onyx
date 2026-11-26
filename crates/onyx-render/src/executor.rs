@@ -35,6 +35,12 @@
 //! resources on both ends of a sampling pass; an MSAA quad pipeline and
 //! multi-target passes land later.
 //!
+//! PBR passes ([`PassKind::Pbr`], [`crate::pbr`]) shade a camera-facing
+//! plane with the Cook-Torrance GGX BRDF: the shader and the CPU mirror
+//! [`crate::pbr::pbr_shaded`] share the exact operation sequence (only
+//! exactly-rounded IEEE f32 operations), so tests compare the GPU output
+//! against the mirror byte for byte.
+//!
 //! The executor is format-agnostic ([`ResourceSpec::format`]): pipelines are
 //! built per (sample count, format) and BGRA readbacks are swizzled back to
 //! RGBA, so [`OffscreenFrame`] stays RGBA-ordered for every target. One
@@ -46,6 +52,7 @@
 
 use crate::graph::{GraphError, RenderGraph};
 use crate::offscreen::{readback_texture, OffscreenFrame};
+use crate::pbr;
 use crate::pipeline;
 use crate::renderer::{RenderError, Renderer};
 use crate::resources::{self, QuadUniform, QuadUniformBuffer};
@@ -75,6 +82,27 @@ pub enum PassKind {
         background: [f64; 4],
         /// UV window: offset xy, scale zw over the source texture.
         uv_window: [f64; 4],
+    },
+    /// A forward PBR material pass ([`crate::pbr`]): shade a fullscreen
+    /// camera-facing plane (N = V = +Z) under one directional light with the
+    /// Cook-Torrance GGX BRDF. The flat, camera-facing geometry makes the
+    /// shaded color exactly predictable per pass — the "material chip" view —
+    /// and [`crate::pbr::pbr_shaded`] mirrors the shader bit for bit.
+    Pbr {
+        /// Surface albedo (base color), linear, components in [0, 1].
+        albedo: [f64; 3],
+        /// Roughness in [0, 1] (GGX α = roughness²).
+        roughness: f64,
+        /// Metallic in [0, 1]: 0 = dielectric, 1 = metal (no diffuse,
+        /// albedo-tinted F0).
+        metallic: f64,
+        /// Directional light direction, pointing at the surface (normalized
+        /// by the executor; must be non-zero).
+        light_dir: [f64; 3],
+        /// Light color, linear, components in [0, 1].
+        light_color: [f64; 3],
+        /// Ambient term, linear, components in [0, 1].
+        ambient: [f64; 3],
     },
 }
 
@@ -185,20 +213,29 @@ struct Target {
 
 /// Resources shared by every pass encoding of one execution — built once on
 /// the calling thread, shared across worker threads (`RenderPipeline`,
-/// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad pipeline
-/// is built per target format up front so encoding threads only look up.
+/// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad and PBR
+/// pipelines are built per needed format/(samples) up front so encoding
+/// threads only look up.
 struct PassEncoderContext {
     quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
+    pbr_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
+    pbr_layout: wgpu::BindGroupLayout,
     quad_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
 impl PassEncoderContext {
-    /// Build the quad pipeline for every distinct `formats` entry (the target
-    /// formats of this execution's sampling passes).
-    fn new(renderer: &Renderer, formats: impl Iterator<Item = wgpu::TextureFormat>) -> Self {
+    /// Build the quad pipeline for every distinct `quad_formats` entry (the
+    /// target formats of this execution's sampling passes) and the PBR
+    /// pipeline for every distinct `pbr_keys` entry — `(samples, format)` of
+    /// this execution's PBR passes.
+    fn new(
+        renderer: &Renderer,
+        quad_formats: impl Iterator<Item = wgpu::TextureFormat>,
+        pbr_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
+    ) -> Self {
         let mut quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)> = Vec::new();
-        for format in formats {
+        for format in quad_formats {
             if !quad_pipelines
                 .iter()
                 .any(|(existing, _)| *existing == format)
@@ -207,8 +244,17 @@ impl PassEncoderContext {
                 quad_pipelines.push((format, built));
             }
         }
+        let mut pbr_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)> = Vec::new();
+        for key in pbr_keys {
+            if !pbr_pipelines.iter().any(|(existing, _)| *existing == key) {
+                let built = pbr::create_pbr_pipeline(renderer, key.1, key.0);
+                pbr_pipelines.push((key, built));
+            }
+        }
         Self {
             quad_pipelines,
+            pbr_pipelines,
+            pbr_layout: pbr::create_pbr_bind_layout(renderer),
             quad_layout: resources::create_quad_bind_layout(renderer),
             sampler: resources::create_sampler(renderer, true),
         }
@@ -221,6 +267,16 @@ impl PassEncoderContext {
             .iter()
             .find(|(existing, _)| *existing == format)
             .expect("quad pipeline prebuilt for every sampling format")
+            .1
+    }
+
+    /// The PBR pipeline for `(samples, format)` (built during [`Self::new`]).
+    fn pbr_pipeline(&self, samples: u32, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        &self
+            .pbr_pipelines
+            .iter()
+            .find(|(existing, _)| *existing == (samples, format))
+            .expect("pbr pipeline prebuilt for every pbr (samples, format)")
             .1
     }
 }
@@ -268,7 +324,7 @@ fn plan_node(
         .find(|node| node.name == node_name)
         .expect("order names come from the graph");
     let reads_expected = match kind {
-        PassKind::Clear(_) | PassKind::Triangle { .. } => 0,
+        PassKind::Clear(_) | PassKind::Triangle { .. } | PassKind::Pbr { .. } => 0,
         PassKind::TexturedQuad { .. } => 1,
     };
     if node.reads.len() != reads_expected {
@@ -280,6 +336,7 @@ fn plan_node(
                     PassKind::Clear(_) => "Clear",
                     PassKind::Triangle { .. } => "Triangle",
                     PassKind::TexturedQuad { .. } => "TexturedQuad",
+                    PassKind::Pbr { .. } => "Pbr",
                 },
                 reads_expected,
                 node.reads.len()
@@ -306,6 +363,25 @@ fn plan_node(
             ),
         })?;
     validate_sample_count(renderer, written, resources[target_index].samples)?;
+    if let PassKind::Pbr {
+        albedo,
+        roughness,
+        metallic,
+        light_dir,
+        light_color,
+        ambient,
+    } = kind
+    {
+        pbr::validate_pbr_params(
+            node_name,
+            albedo,
+            roughness,
+            metallic,
+            light_dir,
+            light_color,
+            ambient,
+        )?;
+    }
 
     // A sampling pass reads a texture: the source must be a declared
     // single-sample target (multisampled textures are not sampleable by this
@@ -644,6 +720,45 @@ fn encode_pass(
             pass_handle.set_bind_group(0, &bind_group, &[]);
             pass_handle.draw(0..6, 0..1);
         }
+        PassKind::Pbr {
+            albedo,
+            roughness,
+            metallic,
+            light_dir,
+            light_color,
+            ambient,
+        } => {
+            // Fixed camera-facing geometry — every dot product is uniform
+            // (see `PbrParams::new`); each pass owns its uniform buffer and
+            // bind group, like the sampling passes.
+            let params =
+                pbr::PbrParams::new(albedo, roughness, metallic, light_dir, light_color, ambient);
+            let uniform_buffer = pbr::PbrUniformBuffer::new(renderer, &params);
+            let bind_group =
+                pbr::create_pbr_bind_group(renderer, &context.pbr_layout, &uniform_buffer);
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass_handle = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("onyx-graph-pbr"),
+                color_attachments: &[Some(attachment)],
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            pass_handle.set_pipeline(context.pbr_pipeline(target.samples, target.format));
+            pass_handle.set_bind_group(0, &bind_group, &[]);
+            pass_handle.draw(0..6, 0..1);
+        }
     }
 }
 
@@ -750,7 +865,14 @@ fn execute_sequential(
         .iter()
         .filter(|pass| matches!(pass.kind, PassKind::TexturedQuad { .. }))
         .map(|pass| targets[pass.target_index].format);
-    let context = PassEncoderContext::new(renderer, quad_formats);
+    let pbr_keys = planned
+        .iter()
+        .filter(|pass| matches!(pass.kind, PassKind::Pbr { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys);
     let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
@@ -808,7 +930,15 @@ pub fn execute_offscreen_parallel(
         .flatten()
         .filter(|pass| matches!(pass.kind, PassKind::TexturedQuad { .. }))
         .map(|pass| targets[pass.target_index].format);
-    let context = PassEncoderContext::new(renderer, quad_formats);
+    let pbr_keys = planned
+        .iter()
+        .flatten()
+        .filter(|pass| matches!(pass.kind, PassKind::Pbr { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys);
     let workers = workers.max(1);
 
     for wave in &planned {
@@ -1703,6 +1833,365 @@ mod tests {
                     execute_with_external_target(&renderer, graph, &resources, &kinds, &external)
                         .expect_err("sampling");
                 assert!(error.to_string().contains("cannot be sampled"), "{error}");
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// The shader mirror: build [`crate::pbr::PbrParams`] from a `PassKind::Pbr`
+    /// and shade it with [`crate::pbr::pbr_shaded`] — the exact bytes the GPU
+    /// must produce (up to the sRGB encode).
+    fn pbr_mirror(
+        albedo: [f64; 3],
+        roughness: f64,
+        metallic: f64,
+        light_dir: [f64; 3],
+        light_color: [f64; 3],
+        ambient: [f64; 3],
+    ) -> [f32; 3] {
+        let params =
+            pbr::PbrParams::new(albedo, roughness, metallic, light_dir, light_color, ambient);
+        pbr::pbr_shaded(&params)
+    }
+
+    /// Compare GPU pixels against the CPU mirror: each channel within 1/255
+    /// (the hardware sRGB encode runs in f32; the reference in f64 — both
+    /// round to the same byte except across a knife-edge boundary).
+    fn assert_matches_mirror(pixels: &[u8], expected: [f32; 3]) {
+        let expected = [
+            linear_to_srgb8(f64::from(expected[0])),
+            linear_to_srgb8(f64::from(expected[1])),
+            linear_to_srgb8(f64::from(expected[2])),
+        ];
+        for chunk in pixels.chunks_exact(4) {
+            for (channel, (got, want)) in chunk[..3].iter().zip(&expected).enumerate() {
+                assert!(
+                    got.abs_diff(*want) <= 1,
+                    "channel {channel}: got {got}, expected within 1 of {want}"
+                );
+            }
+            assert_eq!(chunk[3], 255);
+        }
+    }
+
+    #[test]
+    fn pbr_pass_matches_the_cpu_brdf_mirror() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[node("chip", &[], &["mat"])]);
+                let resources = [ResourceSpec::new("mat", 16, 16)];
+                let albedo = [0.7, 0.5, 0.3];
+                let roughness = 0.35;
+                let metallic = 0.25;
+                let light_dir = [1.0, 1.0, 1.0];
+                let light_color = [1.0, 0.9, 0.8];
+                let ambient = [0.1, 0.1, 0.15];
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Pbr {
+                        albedo,
+                        roughness,
+                        metallic,
+                        light_dir,
+                        light_color,
+                        ambient,
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].1.pixels.len(), 16 * 16 * 4);
+                let expected =
+                    pbr_mirror(albedo, roughness, metallic, light_dir, light_color, ambient);
+                assert_matches_mirror(&frames[0].1.pixels, expected);
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_grazing_light_matches_ambient_albedo_exactly() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // Light perpendicular to the surface (ndotl = 0): diffuse
+                // and specular vanish, so the pass renders ambient * albedo
+                // per channel — exact bytes, no tolerance.
+                let graph = &graph(&[node("chip", &[], &["mat"])]);
+                let resources = [ResourceSpec::new("mat", 8, 8)];
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Pbr {
+                        albedo: [1.0, 0.5, 0.25],
+                        roughness: 0.4,
+                        metallic: 0.0,
+                        light_dir: [1.0, 0.0, 0.0],
+                        light_color: [1.0; 3],
+                        ambient: [0.5, 0.25, 0.5],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let expected = [
+                    linear_to_srgb8(0.5),
+                    linear_to_srgb8(0.125),
+                    linear_to_srgb8(0.125),
+                ];
+                for chunk in frames[0].1.pixels.chunks_exact(4) {
+                    assert_eq!(chunk, &[expected[0], expected[1], expected[2], 255]);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_metal_in_shadow_renders_black() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // Metallic kills diffuse and ambient; ndotl = 0 kills
+                // specular: a metal facing away from the light is black.
+                let graph = &graph(&[node("chip", &[], &["mat"])]);
+                let resources = [ResourceSpec::new("mat", 8, 8)];
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Pbr {
+                        albedo: [0.9, 0.6, 0.2],
+                        roughness: 0.2,
+                        metallic: 1.0,
+                        light_dir: [0.0, 1.0, 0.0],
+                        light_color: [1.0; 3],
+                        ambient: [0.5; 3],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                for chunk in frames[0].1.pixels.chunks_exact(4) {
+                    assert_eq!(chunk, &[0, 0, 0, 255]);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_parallel_matches_sequential() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("dielectric", &[], &["a"]),
+                    node("rough_metal", &[], &["b"]),
+                    node("glossy", &[], &["c"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("a", 8, 8),
+                    ResourceSpec::new("b", 8, 8),
+                    ResourceSpec::new("c", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "dielectric" => Some(PassKind::Pbr {
+                        albedo: [0.7, 0.5, 0.3],
+                        roughness: 0.35,
+                        metallic: 0.0,
+                        light_dir: [1.0, 1.0, 1.0],
+                        light_color: [1.0, 0.9, 0.8],
+                        ambient: [0.1; 3],
+                    }),
+                    "rough_metal" => Some(PassKind::Pbr {
+                        albedo: [0.8, 0.7, 0.6],
+                        roughness: 0.9,
+                        metallic: 1.0,
+                        light_dir: [0.5, 0.5, 1.0],
+                        light_color: [1.0; 3],
+                        ambient: [0.05; 3],
+                    }),
+                    "glossy" => Some(PassKind::Pbr {
+                        albedo: [0.2, 0.4, 0.9],
+                        roughness: 0.1,
+                        metallic: 0.2,
+                        light_dir: [0.0, 0.3, 1.0],
+                        light_color: [1.0; 3],
+                        ambient: [0.0, 0.1, 0.2],
+                    }),
+                    _ => None,
+                };
+                let sequential =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("sequential");
+                let parallel = execute_offscreen_parallel(&renderer, graph, &resources, &kinds, 2)
+                    .expect("parallel");
+                for ((s_name, s_frame), (p_name, p_frame)) in sequential.iter().zip(&parallel) {
+                    assert_eq!(s_name, p_name);
+                    assert_eq!(s_frame.pixels, p_frame.pixels, "target '{s_name}'");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_target_can_be_sampled_by_a_textured_quad() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // PBR renders the chip; a sampling pass blits it through the
+                // quad pipeline — the pixel-exact copy contract of increment
+                // 5, now over PBR-generated content.
+                let graph = &graph(&[
+                    node("chip", &[], &["mat"]),
+                    node("blit", &["mat"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("mat", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Pbr {
+                        albedo: [0.7, 0.5, 0.3],
+                        roughness: 0.35,
+                        metallic: 0.25,
+                        light_dir: [1.0, 1.0, 1.0],
+                        light_color: [1.0, 0.9, 0.8],
+                        ambient: [0.1, 0.1, 0.15],
+                    }),
+                    "blit" => Some(PassKind::TexturedQuad {
+                        tint: [1.0, 1.0, 1.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                        uv_window: [0.0, 0.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(frames[0].1.pixels, frames[1].1.pixels);
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_pass_supports_msaa_targets() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // The chip pass renders into a 4× MSAA target; the resolve
+                // machinery lands the shaded color in the readback texture.
+                let graph = &graph(&[node("chip", &[], &["mat"])]);
+                let resources = [ResourceSpec::with_samples("mat", 8, 8, 4)];
+                let albedo = [0.6, 0.4, 0.2];
+                let light_dir = [0.5, 0.5, 1.0];
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Pbr {
+                        albedo,
+                        roughness: 0.3,
+                        metallic: 0.1,
+                        light_dir,
+                        light_color: [1.0; 3],
+                        ambient: [0.1; 3],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let expected = pbr_mirror(albedo, 0.3, 0.1, light_dir, [1.0; 3], [0.1; 3]);
+                assert_matches_mirror(&frames[0].1.pixels, expected);
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn pbr_passes_reject_invalid_declarations() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let base_graph = &graph(&[node("chip", &[], &["mat"])]);
+                let reads_graph = &graph(&[node("chip", &["mat"], &["mat"])]);
+                let resources = [ResourceSpec::new("mat", 8, 8)];
+                // Out-of-range parameters are rejected before any GPU work.
+                let base = PassKind::Pbr {
+                    albedo: [0.7, 0.5, 0.3],
+                    roughness: 0.35,
+                    metallic: 0.25,
+                    light_dir: [1.0, 1.0, 1.0],
+                    light_color: [1.0, 0.9, 0.8],
+                    ambient: [0.1, 0.1, 0.15],
+                };
+                let PassKind::Pbr {
+                    albedo,
+                    roughness,
+                    metallic,
+                    light_dir,
+                    light_color,
+                    ambient,
+                } = base
+                else {
+                    unreachable!("base is a Pbr pass");
+                };
+                for (kind, needle) in [
+                    (
+                        PassKind::Pbr {
+                            roughness: 1.5,
+                            albedo,
+                            metallic,
+                            light_dir,
+                            light_color,
+                            ambient,
+                        },
+                        "roughness",
+                    ),
+                    (
+                        PassKind::Pbr {
+                            metallic: -0.1,
+                            albedo,
+                            roughness,
+                            light_dir,
+                            light_color,
+                            ambient,
+                        },
+                        "metallic",
+                    ),
+                    (
+                        PassKind::Pbr {
+                            albedo: [0.7, 2.5, 0.3],
+                            roughness,
+                            metallic,
+                            light_dir,
+                            light_color,
+                            ambient,
+                        },
+                        "albedo[1]",
+                    ),
+                    (
+                        PassKind::Pbr {
+                            light_dir: [0.0, 0.0, 0.0],
+                            albedo,
+                            roughness,
+                            metallic,
+                            light_color,
+                            ambient,
+                        },
+                        "zero vector",
+                    ),
+                ] {
+                    let kinds = move |name: &str| match name {
+                        "chip" => Some(kind),
+                        _ => None,
+                    };
+                    let error = execute_offscreen(&renderer, base_graph, &resources, &kinds)
+                        .expect_err("invalid pbr parameters");
+                    assert!(error.to_string().contains(needle), "{error}");
+                }
+                // Pbr reads nothing: a read declaration is a mismatch.
+                let kinds = |name: &str| match name {
+                    "chip" => Some(base),
+                    _ => None,
+                };
+                let error = execute_offscreen(&renderer, reads_graph, &resources, &kinds)
+                    .expect_err("reads");
+                assert!(error.to_string().contains("must read exactly 0"), "{error}");
             }
             Err(RenderError::NoAdapter { .. }) => {}
             Err(other) => panic!("unexpected renderer error: {other}"),

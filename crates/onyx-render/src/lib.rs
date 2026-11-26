@@ -76,12 +76,24 @@
 //!   vsync) and [`surface::SurfaceRenderer`]: acquire → render the
 //!   `backbuffer` node onto the swapchain → present.
 //!
-//! Still ahead in M2: forward PBR, the 2D suite and the post-processing
-//! stack.
+//! M2 (seventh increment) adds forward PBR:
+//!
+//! - [`pbr`] — the Cook-Torrance material pass: GGX distribution, Schlick
+//!   visibility and fresnel, metallic/roughness parameters. The WGSL shader
+//!   and the CPU mirror [`pbr::pbr_shaded`] share the exact operation
+//!   sequence (only exactly-rounded IEEE f32 operations), so the GPU output
+//!   is predictable byte for byte on every backend,
+//! - [`executor::PassKind::Pbr`] — the material pass in the graph: it shades
+//!   a camera-facing plane under one directional light (parameters validated
+//!   up front), renders into any target format and supports per-target
+//!   MSAA, and its output feeds sampling passes like any other resource.
+//!
+//! Still ahead in M2: the 2D suite and the post-processing stack.
 
 pub mod executor;
 pub mod graph;
 pub mod offscreen;
+pub mod pbr;
 pub mod pipeline;
 pub mod renderer;
 pub mod resources;
