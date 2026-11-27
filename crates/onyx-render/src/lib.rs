@@ -102,13 +102,27 @@
 //!   format including per-target MSAA, and a full-viewport white-tint
 //!   sprite is a pixel-exact copy of its source.
 //!
-//! Still ahead in M2: the post-processing stack.
+//! M2 (ninth increment) opens the post-processing stack:
+//!
+//! - [`post`] — screen adjustments, mirroring Godot's `Environment`
+//!   adjustments: brightness, contrast and saturation applied in a fixed
+//!   order in linear space (Rec. 709 luma for the saturation mix), with the
+//!   CPU mirror [`post::adjust`] sharing the exact operation sequence of
+//!   the WGSL shader,
+//! - [`executor::PassKind::Adjust`] — the adjustment pass in the graph: it
+//!   reads one source texture, applies the chain over the fullscreen quad
+//!   (parameters validated to [0, 8]), renders any target format including
+//!   per-target MSAA, leaves alpha untouched, and identity parameters are a
+//!   pixel-exact copy of the source.
+//!
+//! Still ahead in M2: separable blur (the glow/bloom base).
 
 pub mod executor;
 pub mod graph;
 pub mod offscreen;
 pub mod pbr;
 pub mod pipeline;
+pub mod post;
 pub mod renderer;
 pub mod resources;
 pub mod sprite;

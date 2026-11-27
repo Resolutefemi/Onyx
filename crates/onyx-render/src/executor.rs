@@ -47,6 +47,12 @@
 //! order, under the 1:1 viewport camera whose projection the CPU mirror
 //! [`crate::sprite::Camera2d::project`] reproduces bit for bit.
 //!
+//! Adjust passes ([`PassKind::Adjust`], [`crate::post`]) apply Godot
+//! `Environment`-style screen adjustments — brightness, contrast,
+//! saturation, in that fixed order — over the node's declared read
+//! resource, with [`crate::post::adjust`] as the bit-for-bit CPU mirror;
+//! identity parameters are a pixel-exact copy of the source.
+//!
 //! The executor is format-agnostic ([`ResourceSpec::format`]): pipelines are
 //! built per (sample count, format) and BGRA readbacks are swizzled back to
 //! RGBA, so [`OffscreenFrame`] stays RGBA-ordered for every target. One
@@ -60,6 +66,7 @@ use crate::graph::{GraphError, RenderGraph};
 use crate::offscreen::{readback_texture, OffscreenFrame};
 use crate::pbr;
 use crate::pipeline;
+use crate::post;
 use crate::renderer::{RenderError, Renderer};
 use crate::resources::{self, QuadUniform, QuadUniformBuffer};
 use crate::sprite;
@@ -122,6 +129,23 @@ pub enum PassKind {
         /// The sprite batch, drawn in order.
         sprites: Vec<sprite::Sprite2d>,
         /// Load-op clear color behind the batch.
+        background: [f64; 4],
+    },
+    /// A post-processing screen-adjustment pass ([`crate::post`]): sample
+    /// the node's declared read resource fullscreen and apply Godot
+    /// `Environment`-style adjustments — brightness, contrast, saturation —
+    /// in linear space, in that fixed order, with Rec. 709 luma for the
+    /// saturation mix. Identity parameters (1, 1, 1) are a pixel-exact
+    /// copy; alpha passes through untouched.
+    Adjust {
+        /// Brightness multiplier, identity 1.0 (validated to [0, 8]).
+        brightness: f64,
+        /// Contrast around mid-gray 0.5, identity 1.0 (validated to [0, 8]).
+        contrast: f64,
+        /// Saturation toward Rec. 709 luma, identity 1.0, 0 = grayscale
+        /// (validated to [0, 8]).
+        saturation: f64,
+        /// Load-op clear color behind the quad.
         background: [f64; 4],
     },
 }
@@ -233,29 +257,33 @@ struct Target {
 
 /// Resources shared by every pass encoding of one execution — built once on
 /// the calling thread, shared across worker threads (`RenderPipeline`,
-/// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad and PBR
-/// and sprite pipelines are built per needed format/(samples) up front so
-/// encoding threads only look up.
+/// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad
+/// pipeline is built per needed format and the PBR, sprite and adjust
+/// pipelines per needed `(samples, format)` up front so encoding threads
+/// only look up.
 struct PassEncoderContext {
     quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     pbr_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     sprite_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
+    post_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     pbr_layout: wgpu::BindGroupLayout,
     sprite_layout: wgpu::BindGroupLayout,
+    post_layout: wgpu::BindGroupLayout,
     quad_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
 impl PassEncoderContext {
     /// Build the quad pipeline for every distinct `quad_formats` entry (the
-    /// target formats of this execution's sampling passes), and the PBR and
-    /// sprite pipelines for every distinct `(samples, format)` key of this
-    /// execution's PBR and sprite passes.
+    /// target formats of this execution's sampling passes), and the PBR,
+    /// sprite and adjust pipelines for every distinct `(samples, format)`
+    /// key of this execution's PBR, sprite and adjust passes.
     fn new(
         renderer: &Renderer,
         quad_formats: impl Iterator<Item = wgpu::TextureFormat>,
         pbr_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
         sprite_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
+        post_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
     ) -> Self {
         let mut quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)> = Vec::new();
         for format in quad_formats {
@@ -285,12 +313,22 @@ impl PassEncoderContext {
                 sprite_pipelines.push((key, built));
             }
         }
+        let mut post_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)> =
+            Vec::new();
+        for key in post_keys {
+            if !post_pipelines.iter().any(|(existing, _)| *existing == key) {
+                let built = post::create_adjust_pipeline(renderer, key.1, key.0);
+                post_pipelines.push((key, built));
+            }
+        }
         Self {
             quad_pipelines,
             pbr_pipelines,
             sprite_pipelines,
+            post_pipelines,
             pbr_layout: pbr::create_pbr_bind_layout(renderer),
             sprite_layout: sprite::create_sprite_bind_layout(renderer),
+            post_layout: post::create_adjust_bind_layout(renderer),
             quad_layout: resources::create_quad_bind_layout(renderer),
             sampler: resources::create_sampler(renderer, true),
         }
@@ -324,6 +362,17 @@ impl PassEncoderContext {
             .iter()
             .find(|(existing, _)| *existing == (samples, format))
             .expect("sprite pipeline prebuilt for every sprite (samples, format)")
+            .1
+    }
+
+    /// The adjust pipeline for `(samples, format)` (built during
+    /// [`Self::new`]).
+    fn post_pipeline(&self, samples: u32, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        &self
+            .post_pipelines
+            .iter()
+            .find(|(existing, _)| *existing == (samples, format))
+            .expect("adjust pipeline prebuilt for every adjust (samples, format)")
             .1
     }
 }
@@ -373,7 +422,7 @@ fn plan_node(
         .expect("order names come from the graph");
     let reads_expected = match kind {
         PassKind::Clear(_) | PassKind::Triangle { .. } | PassKind::Pbr { .. } => 0,
-        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } => 1,
+        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } | PassKind::Adjust { .. } => 1,
     };
     if node.reads.len() != reads_expected {
         return Err(RenderError::Unsupported {
@@ -386,6 +435,7 @@ fn plan_node(
                     PassKind::TexturedQuad { .. } => "TexturedQuad",
                     PassKind::Pbr { .. } => "Pbr",
                     PassKind::Sprites2d { .. } => "Sprites2d",
+                    PassKind::Adjust { .. } => "Adjust",
                 },
                 reads_expected,
                 node.reads.len()
@@ -431,14 +481,23 @@ fn plan_node(
             *ambient,
         )?;
     }
+    if let PassKind::Adjust {
+        brightness,
+        contrast,
+        saturation,
+        ..
+    } = &kind
+    {
+        post::validate_adjust_params(node_name, *brightness, *contrast, *saturation)?;
+    }
 
     // A sampling pass reads a texture: the source must be a declared
     // single-sample target (multisampled textures are not sampleable by
-    // these pipelines). The quad draws only into single-sample targets; the
-    // sprite pass has per-(samples, format) pipelines and renders MSAA
-    // targets through the resolve machinery.
+    // these pipelines). The quad draws only into single-sample targets;
+    // the sprite and adjust passes have per-(samples, format) pipelines
+    // and render MSAA targets through the resolve machinery.
     let read_index = match kind {
-        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } => {
+        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } | PassKind::Adjust { .. } => {
             let source = node.reads[0];
             let index = resources
                 .iter()
@@ -881,6 +940,54 @@ fn encode_pass(
                 pass_handle.draw(0..vertices.len() as u32, 0..1);
             }
         }
+        PassKind::Adjust {
+            brightness,
+            contrast,
+            saturation,
+            background,
+        } => {
+            // The fullscreen quad of the sampling passes with the adjust
+            // shader: the parameters pack into one vec4 uniform, the source
+            // is the declared read resource, and alpha passes through
+            // untouched.
+            let read_index = pass.read_index.expect("Adjust plans a read");
+            let source_view = &targets[read_index].view;
+            let params = post::AdjustParams {
+                brightness: *brightness as f32,
+                contrast: *contrast as f32,
+                saturation: *saturation as f32,
+            };
+            let uniform = post::AdjustUniformBuffer::new(renderer, &params);
+            let bind_group = post::create_adjust_bind_group(
+                renderer,
+                &context.post_layout,
+                &uniform,
+                source_view,
+                &context.sampler,
+            );
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: background[0],
+                        g: background[1],
+                        b: background[2],
+                        a: background[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass_handle = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("onyx-graph-adjust"),
+                color_attachments: &[Some(attachment)],
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            pass_handle.set_pipeline(context.post_pipeline(target.samples, target.format));
+            pass_handle.set_bind_group(0, &bind_group, &[]);
+            pass_handle.draw(0..6, 0..1);
+        }
     }
 }
 
@@ -1001,7 +1108,14 @@ fn execute_sequential(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys);
+    let post_keys = planned
+        .iter()
+        .filter(|pass| matches!(pass.kind, PassKind::Adjust { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys, post_keys);
     let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
@@ -1075,7 +1189,15 @@ pub fn execute_offscreen_parallel(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys);
+    let post_keys = planned
+        .iter()
+        .flatten()
+        .filter(|pass| matches!(pass.kind, PassKind::Adjust { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys, post_keys);
     let workers = workers.max(1);
 
     for wave in &planned {
@@ -2665,6 +2787,335 @@ mod tests {
                     error.to_string().contains("single-sample"),
                     "source error must explain the constraint: {error}"
                 );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// The expected bytes of a solid source under the adjust chain: sRGB
+    /// decode → brightness → contrast → Rec. 709 saturation mix → clamp →
+    /// sRGB encode, in f64 (the GPU computes the same sequence in f32, so
+    /// the tests allow ±1 LSB on the adjusted channels). Alpha passes
+    /// through untouched.
+    fn adjusted_solid(source: [u8; 4], brightness: f64, contrast: f64, saturation: f64) -> [u8; 4] {
+        let mut v = [
+            srgb8_to_linear(source[0]) * brightness,
+            srgb8_to_linear(source[1]) * brightness,
+            srgb8_to_linear(source[2]) * brightness,
+        ];
+        for channel in &mut v {
+            *channel = (*channel - 0.5) * contrast + 0.5;
+        }
+        let luma = v[0] * 0.2126 + v[1] * 0.7152 + v[2] * 0.0722;
+        for channel in &mut v {
+            *channel = luma + (*channel - luma) * saturation;
+        }
+        [
+            linear_to_srgb8(v[0].clamp(0.0, 1.0)),
+            linear_to_srgb8(v[1].clamp(0.0, 1.0)),
+            linear_to_srgb8(v[2].clamp(0.0, 1.0)),
+            source[3],
+        ]
+    }
+
+    /// Assert chunk vs expected with ±1 LSB on the adjusted RGB channels
+    /// (the GPU computes in f32, this model in f64); alpha is exact.
+    fn assert_adjusted_chunk(chunk: &[u8], expected: [u8; 4]) {
+        for k in 0..4 {
+            let tolerance = if k < 3 { 1 } else { 0 };
+            assert!(
+                (i32::from(chunk[k]) - i32::from(expected[k])).abs() <= tolerance,
+                "channel {k}: {chunk:?} vs {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn adjust_identity_is_a_pixel_exact_copy() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("adjust", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 16, 16),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.8, 0.2, 0.6, 1.0])),
+                    "adjust" => Some(PassKind::Adjust {
+                        brightness: 1.0,
+                        contrast: 1.0,
+                        saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(
+                    frames[1].1.pixels, frames[0].1.pixels,
+                    "identity adjustments are a pixel-exact copy"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_brightness_contrast_saturation_match_expectation() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("adjust", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let solid = [0.8, 0.2, 0.6, 1.0];
+                let source = [
+                    linear_to_srgb8(solid[0]),
+                    linear_to_srgb8(solid[1]),
+                    linear_to_srgb8(solid[2]),
+                    linear_to_srgb8(solid[3]),
+                ];
+                for (brightness, contrast, saturation) in
+                    [(0.5, 1.0, 1.0), (1.0, 0.5, 1.0), (1.0, 1.0, 0.5)]
+                {
+                    let kinds = |name: &str| match name {
+                        "paint" => Some(PassKind::Clear(solid)),
+                        "adjust" => Some(PassKind::Adjust {
+                            brightness,
+                            contrast,
+                            saturation,
+                            background: [0.0, 0.0, 0.0, 1.0],
+                        }),
+                        _ => None,
+                    };
+                    let frames =
+                        execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                    let expected = adjusted_solid(source, brightness, contrast, saturation);
+                    for chunk in frames[1].1.pixels.chunks_exact(4) {
+                        assert_adjusted_chunk(chunk, expected);
+                    }
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_grays_survive_saturation_exactly() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // Grays are fixed points of the chain: the luma of a gray
+                // is the gray itself, so the saturation mix cannot change
+                // it — byte-exact, no tolerance.
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("adjust", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.5, 0.5, 0.5, 1.0])),
+                    "adjust" => Some(PassKind::Adjust {
+                        brightness: 1.0,
+                        contrast: 1.0,
+                        saturation: 0.5,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(
+                    frames[1].1.pixels, frames[0].1.pixels,
+                    "grays survive saturation byte-exactly"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_pass_supports_msaa_targets() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // The fullscreen quad renders through a 4× MSAA attachment
+                // and resolves into the readback texture; a flat quad's
+                // samples are identical, so the resolve is the adjusted
+                // texel.
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("adjust", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::with_samples("post", 8, 8, 4),
+                ];
+                let solid = [0.8, 0.2, 0.6, 1.0];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear(solid)),
+                    "adjust" => Some(PassKind::Adjust {
+                        brightness: 0.5,
+                        contrast: 1.0,
+                        saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let source = [
+                    linear_to_srgb8(solid[0]),
+                    linear_to_srgb8(solid[1]),
+                    linear_to_srgb8(solid[2]),
+                    linear_to_srgb8(solid[3]),
+                ];
+                let expected = adjusted_solid(source, 0.5, 1.0, 1.0);
+                for chunk in frames[1].1.pixels.chunks_exact(4) {
+                    assert_adjusted_chunk(chunk, expected);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_parallel_matches_sequential() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'paint' fills "scene" (wave 1); 'dim' and 'pop' adjust it
+                // with different parameters (wave 2, parallel).
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("dim", &["scene"], &["a"]),
+                    node("pop", &["scene"], &["b"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("a", 8, 8),
+                    ResourceSpec::new("b", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.8, 0.2, 0.6, 1.0])),
+                    "dim" => Some(PassKind::Adjust {
+                        brightness: 0.5,
+                        contrast: 1.0,
+                        saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "pop" => Some(PassKind::Adjust {
+                        brightness: 1.0,
+                        contrast: 2.0,
+                        saturation: 1.0,
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let sequential =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("sequential");
+                let parallel = execute_offscreen_parallel(&renderer, graph, &resources, &kinds, 2)
+                    .expect("parallel");
+                for ((s_name, s_frame), (p_name, p_frame)) in sequential.iter().zip(&parallel) {
+                    assert_eq!(s_name, p_name);
+                    assert_eq!(s_frame.pixels, p_frame.pixels, "target '{s_name}'");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_rejects_multisampled_source() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("adjust", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::with_samples("scene", 16, 16, 4),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.5, 0.5, 0.5, 1.0])),
+                    "adjust" => Some(PassKind::Adjust {
+                        brightness: 1.0,
+                        contrast: 1.0,
+                        saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("msaa");
+                assert!(
+                    error.to_string().contains("single-sample"),
+                    "source error must explain the constraint: {error}"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn adjust_rejects_invalid_parameters_and_read_counts() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let param_graph = &graph(&[node("chip", &["scene"], &["post"])]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                for (brightness, contrast, saturation, needle) in [
+                    (-0.5, 1.0, 1.0, "brightness"),
+                    (1.0, 8.5, 1.0, "contrast"),
+                    (1.0, 1.0, f64::NAN, "saturation"),
+                ] {
+                    let kinds = move |name: &str| match name {
+                        "chip" => Some(PassKind::Adjust {
+                            brightness,
+                            contrast,
+                            saturation,
+                            background: [0.0, 0.0, 0.0, 1.0],
+                        }),
+                        _ => None,
+                    };
+                    let error = execute_offscreen(&renderer, param_graph, &resources, &kinds)
+                        .expect_err("range");
+                    assert!(
+                        error.to_string().contains(needle) && error.to_string().contains("[0, 8]"),
+                        "{needle} error must explain the range: {error}"
+                    );
+                }
+                // Adjust reads exactly one resource.
+                let reads_graph = &graph(&[node("chip", &[], &["post"])]);
+                let kinds = |name: &str| match name {
+                    "chip" => Some(PassKind::Adjust {
+                        brightness: 1.0,
+                        contrast: 1.0,
+                        saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let error = execute_offscreen(&renderer, reads_graph, &resources, &kinds)
+                    .expect_err("reads");
+                assert!(error.to_string().contains("must read exactly 1"), "{error}");
             }
             Err(RenderError::NoAdapter { .. }) => {}
             Err(other) => panic!("unexpected renderer error: {other}"),
