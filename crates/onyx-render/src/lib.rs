@@ -115,7 +115,23 @@
 //!   per-target MSAA, leaves alpha untouched, and identity parameters are a
 //!   pixel-exact copy of the source.
 //!
-//! Still ahead in M2: separable blur (the glow/bloom base).
+//! M2 (tenth increment) completes the post-processing stack — and M2 —
+//! with the separable tent blur:
+//!
+//! - [`post`] gains the 3-tap tent blur (`BLUR_WGSL`, weights
+//!   `[0.25, 0.5, 0.25]` on all four channels), with [`post::tent3`] as
+//!   the bit-for-bit CPU mirror of the shader's blend,
+//! - [`executor::PassKind::Blur`] — the blur pass in the graph: it reads
+//!   one source texture, tents along a direction in texel units
+//!   (validated non-zero, components in [-8, 8]; the executor scales it
+//!   to the source's per-tap UV step), renders any target format
+//!   including per-target MSAA, and two chained nodes — horizontal then
+//!   vertical — form the separable blur that glows and blooms build on.
+//!
+//! That closes M2's milestone scope — the wgpu foundation, the render
+//! graph with both executors, triangle/quad/sampling passes, MSAA,
+//! windowed present, forward PBR, the 2D sprite suite and the
+//! post-processing stack. M3 (the MCP control plane, PRD §16) is next.
 
 pub mod executor;
 pub mod graph;

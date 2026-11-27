@@ -53,6 +53,12 @@
 //! resource, with [`crate::post::adjust`] as the bit-for-bit CPU mirror;
 //! identity parameters are a pixel-exact copy of the source.
 //!
+//! Blur passes ([`PassKind::Blur`], [`crate::post`]) blend a 3-tap tent —
+//! weights `[0.25, 0.5, 0.25]` — along a texel direction over the node's
+//! declared read resource with the same fullscreen quad; two chained
+//! nodes, horizontal then vertical, form the separable blur that glows and
+//! blooms build on, with [`crate::post::tent3`] as the exact CPU mirror.
+//!
 //! The executor is format-agnostic ([`ResourceSpec::format`]): pipelines are
 //! built per (sample count, format) and BGRA readbacks are swizzled back to
 //! RGBA, so [`OffscreenFrame`] stays RGBA-ordered for every target. One
@@ -145,6 +151,20 @@ pub enum PassKind {
         /// Saturation toward Rec. 709 luma, identity 1.0, 0 = grayscale
         /// (validated to [0, 8]).
         saturation: f64,
+        /// Load-op clear color behind the quad.
+        background: [f64; 4],
+    },
+    /// A separable tent-blur pass ([`crate::post`]): sample the node's
+    /// declared read resource fullscreen and blend a 3-tap tent — weights
+    /// `[0.25, 0.5, 0.25]` — along `direction` (texel units; the executor
+    /// scales it to the per-tap UV step of the source). Two chained nodes,
+    /// horizontal then vertical, form the separable blur that glows and
+    /// blooms build on; [`crate::post::tent3`] mirrors the shader's exact
+    /// operation sequence.
+    Blur {
+        /// Blur direction in texel units (validated non-zero, components
+        /// within [-8, 8]).
+        direction: [f64; 2],
         /// Load-op clear color behind the quad.
         background: [f64; 4],
     },
@@ -258,17 +278,19 @@ struct Target {
 /// Resources shared by every pass encoding of one execution — built once on
 /// the calling thread, shared across worker threads (`RenderPipeline`,
 /// `BindGroupLayout` and `Sampler` are all `Send + Sync`). The quad
-/// pipeline is built per needed format and the PBR, sprite and adjust
-/// pipelines per needed `(samples, format)` up front so encoding threads
-/// only look up.
+/// pipeline is built per needed format and the PBR, sprite, adjust and
+/// blur pipelines per needed `(samples, format)` up front so encoding
+/// threads only look up.
 struct PassEncoderContext {
     quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     pbr_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     sprite_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     post_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
+    blur_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)>,
     pbr_layout: wgpu::BindGroupLayout,
     sprite_layout: wgpu::BindGroupLayout,
     post_layout: wgpu::BindGroupLayout,
+    blur_layout: wgpu::BindGroupLayout,
     quad_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
@@ -276,14 +298,16 @@ struct PassEncoderContext {
 impl PassEncoderContext {
     /// Build the quad pipeline for every distinct `quad_formats` entry (the
     /// target formats of this execution's sampling passes), and the PBR,
-    /// sprite and adjust pipelines for every distinct `(samples, format)`
-    /// key of this execution's PBR, sprite and adjust passes.
+    /// sprite, adjust and blur pipelines for every distinct
+    /// `(samples, format)` key of this execution's PBR, sprite, adjust and
+    /// blur passes.
     fn new(
         renderer: &Renderer,
         quad_formats: impl Iterator<Item = wgpu::TextureFormat>,
         pbr_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
         sprite_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
         post_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
+        blur_keys: impl Iterator<Item = (u32, wgpu::TextureFormat)>,
     ) -> Self {
         let mut quad_pipelines: Vec<(wgpu::TextureFormat, wgpu::RenderPipeline)> = Vec::new();
         for format in quad_formats {
@@ -321,14 +345,24 @@ impl PassEncoderContext {
                 post_pipelines.push((key, built));
             }
         }
+        let mut blur_pipelines: Vec<((u32, wgpu::TextureFormat), wgpu::RenderPipeline)> =
+            Vec::new();
+        for key in blur_keys {
+            if !blur_pipelines.iter().any(|(existing, _)| *existing == key) {
+                let built = post::create_blur_pipeline(renderer, key.1, key.0);
+                blur_pipelines.push((key, built));
+            }
+        }
         Self {
             quad_pipelines,
             pbr_pipelines,
             sprite_pipelines,
             post_pipelines,
+            blur_pipelines,
             pbr_layout: pbr::create_pbr_bind_layout(renderer),
             sprite_layout: sprite::create_sprite_bind_layout(renderer),
             post_layout: post::create_adjust_bind_layout(renderer),
+            blur_layout: post::create_blur_bind_layout(renderer),
             quad_layout: resources::create_quad_bind_layout(renderer),
             sampler: resources::create_sampler(renderer, true),
         }
@@ -375,6 +409,17 @@ impl PassEncoderContext {
             .expect("adjust pipeline prebuilt for every adjust (samples, format)")
             .1
     }
+
+    /// The blur pipeline for `(samples, format)` (built during
+    /// [`Self::new`]).
+    fn blur_pipeline(&self, samples: u32, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        &self
+            .blur_pipelines
+            .iter()
+            .find(|(existing, _)| *existing == (samples, format))
+            .expect("blur pipeline prebuilt for every blur (samples, format)")
+            .1
+    }
 }
 
 /// Validate sample counts against the adapter before any GPU work.
@@ -400,9 +445,9 @@ fn validate_sample_count(renderer: &Renderer, name: &str, samples: u32) -> Resul
 /// Validate one node and resolve its declarations into a [`PlannedPass`]:
 /// pass kind required, exactly one declared write target, and read
 /// declarations that match the pass kind (`Clear`/`Triangle`/`Pbr` read
-/// nothing, `TexturedQuad`/`Sprites2d` read exactly one declared
-/// single-sample source). Runs before any GPU work so both executors
-/// reject bad graphs up front.
+/// nothing, `TexturedQuad`/`Sprites2d`/`Adjust`/`Blur` read exactly one
+/// declared single-sample source). Runs before any GPU work so both
+/// executors reject bad graphs up front.
 fn plan_node(
     renderer: &Renderer,
     graph: &RenderGraph,
@@ -422,7 +467,10 @@ fn plan_node(
         .expect("order names come from the graph");
     let reads_expected = match kind {
         PassKind::Clear(_) | PassKind::Triangle { .. } | PassKind::Pbr { .. } => 0,
-        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } | PassKind::Adjust { .. } => 1,
+        PassKind::TexturedQuad { .. }
+        | PassKind::Sprites2d { .. }
+        | PassKind::Adjust { .. }
+        | PassKind::Blur { .. } => 1,
     };
     if node.reads.len() != reads_expected {
         return Err(RenderError::Unsupported {
@@ -436,6 +484,7 @@ fn plan_node(
                     PassKind::Pbr { .. } => "Pbr",
                     PassKind::Sprites2d { .. } => "Sprites2d",
                     PassKind::Adjust { .. } => "Adjust",
+                    PassKind::Blur { .. } => "Blur",
                 },
                 reads_expected,
                 node.reads.len()
@@ -490,14 +539,20 @@ fn plan_node(
     {
         post::validate_adjust_params(node_name, *brightness, *contrast, *saturation)?;
     }
+    if let PassKind::Blur { direction, .. } = &kind {
+        post::validate_blur_params(node_name, *direction)?;
+    }
 
     // A sampling pass reads a texture: the source must be a declared
     // single-sample target (multisampled textures are not sampleable by
     // these pipelines). The quad draws only into single-sample targets;
-    // the sprite and adjust passes have per-(samples, format) pipelines
-    // and render MSAA targets through the resolve machinery.
+    // the sprite, adjust and blur passes have per-(samples, format)
+    // pipelines and render MSAA targets through the resolve machinery.
     let read_index = match kind {
-        PassKind::TexturedQuad { .. } | PassKind::Sprites2d { .. } | PassKind::Adjust { .. } => {
+        PassKind::TexturedQuad { .. }
+        | PassKind::Sprites2d { .. }
+        | PassKind::Adjust { .. }
+        | PassKind::Blur { .. } => {
             let source = node.reads[0];
             let index = resources
                 .iter()
@@ -988,6 +1043,53 @@ fn encode_pass(
             pass_handle.set_bind_group(0, &bind_group, &[]);
             pass_handle.draw(0..6, 0..1);
         }
+        PassKind::Blur {
+            direction,
+            background,
+        } => {
+            // The fullscreen quad with the blur shader: the direction in
+            // texel units scales by the source's size into the per-tap UV
+            // step (one texel for the standard horizontal/vertical
+            // passes). The tent blend runs on all four channels, so
+            // opaque alpha stays exactly opaque.
+            let read_index = pass.read_index.expect("Blur plans a read");
+            let source = &targets[read_index];
+            let step = [
+                direction[0] as f32 / source.width as f32,
+                direction[1] as f32 / source.height as f32,
+            ];
+            let params = post::BlurParams { step };
+            let uniform = post::BlurUniformBuffer::new(renderer, &params);
+            let bind_group = post::create_blur_bind_group(
+                renderer,
+                &context.blur_layout,
+                &uniform,
+                &source.view,
+                &context.sampler,
+            );
+            let attachment = wgpu::RenderPassColorAttachment {
+                view: attachment_view,
+                depth_slice: None,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: background[0],
+                        g: background[1],
+                        b: background[2],
+                        a: background[3],
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            };
+            let mut pass_handle = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("onyx-graph-blur"),
+                color_attachments: &[Some(attachment)],
+                ..wgpu::RenderPassDescriptor::default()
+            });
+            pass_handle.set_pipeline(context.blur_pipeline(target.samples, target.format));
+            pass_handle.set_bind_group(0, &bind_group, &[]);
+            pass_handle.draw(0..6, 0..1);
+        }
     }
 }
 
@@ -1115,7 +1217,21 @@ fn execute_sequential(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys, post_keys);
+    let blur_keys = planned
+        .iter()
+        .filter(|pass| matches!(pass.kind, PassKind::Blur { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(
+        renderer,
+        quad_formats,
+        pbr_keys,
+        sprite_keys,
+        post_keys,
+        blur_keys,
+    );
     let mut triangle_pipelines = Vec::new();
     let mut encoder = renderer
         .device
@@ -1197,7 +1313,22 @@ pub fn execute_offscreen_parallel(
             let target = &targets[pass.target_index];
             (target.samples, target.format)
         });
-    let context = PassEncoderContext::new(renderer, quad_formats, pbr_keys, sprite_keys, post_keys);
+    let blur_keys = planned
+        .iter()
+        .flatten()
+        .filter(|pass| matches!(pass.kind, PassKind::Blur { .. }))
+        .map(|pass| {
+            let target = &targets[pass.target_index];
+            (target.samples, target.format)
+        });
+    let context = PassEncoderContext::new(
+        renderer,
+        quad_formats,
+        pbr_keys,
+        sprite_keys,
+        post_keys,
+        blur_keys,
+    );
     let workers = workers.max(1);
 
     for wave in &planned {
@@ -3109,6 +3240,368 @@ mod tests {
                         brightness: 1.0,
                         contrast: 1.0,
                         saturation: 1.0,
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let error = execute_offscreen(&renderer, reads_graph, &resources, &kinds)
+                    .expect_err("reads");
+                assert!(error.to_string().contains("must read exactly 1"), "{error}");
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    /// The expected byte of one tent hop at position `i` along an 8-long
+    /// axis of the half-split pattern (`dark` byte in the low half,
+    /// `light` byte in the high half): samples at `i - 1`, `i`, `i + 1`
+    /// (the half-split predicate is its own ClampToEdge extension), tent
+    /// weights in f64, re-encoded. The GPU computes the same sequence in
+    /// f32, so a single hop allows ±1 LSB.
+    fn tent_half_split(i: i32, dark: u8, light: u8) -> u8 {
+        let sample = |j: i32| srgb8_to_linear(if j < 4 { dark } else { light });
+        linear_to_srgb8(sample(i - 1) * 0.25 + sample(i) * 0.5 + sample(i + 1) * 0.25)
+    }
+
+    /// Assert chunk vs expected with ±`tolerance` LSB on RGB; alpha is
+    /// exact (the tent of opaque alpha is exactly opaque).
+    fn assert_blurred_chunk(chunk: &[u8], expected: [u8; 4], tolerance: i32) {
+        for k in 0..4 {
+            let limit = if k < 3 { tolerance } else { 0 };
+            assert!(
+                (i32::from(chunk[k]) - i32::from(expected[k])).abs() <= limit,
+                "channel {k}: {chunk:?} vs {expected:?}"
+            );
+        }
+    }
+
+    /// The expected pixel of the separable chain over the quadrant pattern
+    /// (`dark` byte in the top-left 4×4 quadrant, `light` byte elsewhere):
+    /// hop 1 tents along x and re-encodes to bytes (the GPU stores bytes
+    /// between passes), hop 2 tents along y over those bytes. In f64
+    /// throughout; the GPU computes each hop in f32, so the two-hop chain
+    /// allows ±2 LSB.
+    fn blurred_quadrant(x: i32, y: i32, dark: u8, light: u8) -> [u8; 4] {
+        let pattern = |x: i32, y: i32| srgb8_to_linear(if x < 4 && y < 4 { dark } else { light });
+        let h = |x: i32, y: i32| {
+            0.25 * pattern(x - 1, y) + 0.5 * pattern(x, y) + 0.25 * pattern(x + 1, y)
+        };
+        let h_byte = |x: i32, y: i32| linear_to_srgb8(h(x, y));
+        let v = |x: i32, y: i32| {
+            0.25 * srgb8_to_linear(h_byte(x, y - 1))
+                + 0.5 * srgb8_to_linear(h_byte(x, y))
+                + 0.25 * srgb8_to_linear(h_byte(x, y + 1))
+        };
+        let byte = linear_to_srgb8(v(x, y));
+        [byte, byte, byte, 255]
+    }
+
+    #[test]
+    fn blur_of_a_solid_is_a_pixel_exact_copy() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // Every tap of a solid samples the same texel, and the
+                // tent weights sum to 1.0 — byte-exact copy.
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("blur", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.8, 0.2, 0.6, 1.0])),
+                    "blur" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                assert_eq!(
+                    frames[1].1.pixels, frames[0].1.pixels,
+                    "blur of a solid is a pixel-exact copy"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_horizontal_and_vertical_match_the_tent_model() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'pattern' splits dark/light by column (horizontal test)
+                // or by row (vertical test): a half-viewport sprite tinted
+                // 0.5 over a white background and a white source.
+                let dark = linear_to_srgb8(0.5);
+                let light = 255u8;
+                for (horizontal, rect) in [
+                    ([1.0, 0.0], [0.0, 0.0, 4.0, 8.0]),
+                    ([0.0, 1.0], [0.0, 0.0, 8.0, 4.0]),
+                ] {
+                    let graph = &graph(&[
+                        node("paint", &[], &["white"]),
+                        node("pattern", &["white"], &["pattern"]),
+                        node("blur", &["pattern"], &["post"]),
+                    ]);
+                    let resources = [
+                        ResourceSpec::new("white", 8, 8),
+                        ResourceSpec::new("pattern", 8, 8),
+                        ResourceSpec::new("post", 8, 8),
+                    ];
+                    let kinds = |name: &str| match name {
+                        "paint" => Some(PassKind::Clear([1.0, 1.0, 1.0, 1.0])),
+                        "pattern" => Some(PassKind::Sprites2d {
+                            sprites: vec![sprite::Sprite2d {
+                                rect,
+                                uv: [0.0, 0.0, 1.0, 1.0],
+                                tint: [0.5, 0.5, 0.5, 1.0],
+                            }],
+                            background: [1.0, 1.0, 1.0, 1.0],
+                        }),
+                        "blur" => Some(PassKind::Blur {
+                            direction: horizontal,
+                            background: [0.0, 0.0, 0.0, 1.0],
+                        }),
+                        _ => None,
+                    };
+                    let frames =
+                        execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                    for (index, chunk) in frames[2].1.pixels.chunks_exact(4).enumerate() {
+                        let along = if horizontal == [1.0, 0.0] {
+                            index % 8
+                        } else {
+                            index / 8
+                        } as i32;
+                        let byte = tent_half_split(along, dark, light);
+                        assert_blurred_chunk(chunk, [byte, byte, byte, 255], 1);
+                    }
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_separable_chain_matches_two_tents() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // The quadrant pattern varies on both axes, so the chain
+                // genuinely composes: horizontal tent, byte store, vertical
+                // tent over the stored bytes.
+                let graph = &graph(&[
+                    node("paint", &[], &["white"]),
+                    node("pattern", &["white"], &["pattern"]),
+                    node("hblur", &["pattern"], &["h"]),
+                    node("vblur", &["h"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("white", 8, 8),
+                    ResourceSpec::new("pattern", 8, 8),
+                    ResourceSpec::new("h", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([1.0, 1.0, 1.0, 1.0])),
+                    "pattern" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 4.0, 4.0],
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                            tint: [0.5, 0.5, 0.5, 1.0],
+                        }],
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    "hblur" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "vblur" => Some(PassKind::Blur {
+                        direction: [0.0, 1.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let dark = linear_to_srgb8(0.5);
+                for (index, chunk) in frames[3].1.pixels.chunks_exact(4).enumerate() {
+                    let expected =
+                        blurred_quadrant((index % 8) as i32, (index / 8) as i32, dark, 255);
+                    assert_blurred_chunk(chunk, expected, 2);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_pass_supports_msaa_targets() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // A flat quad's samples are identical, so the 4× resolve
+                // is the blurred texel.
+                let graph = &graph(&[
+                    node("paint", &[], &["white"]),
+                    node("pattern", &["white"], &["pattern"]),
+                    node("blur", &["pattern"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("white", 8, 8),
+                    ResourceSpec::new("pattern", 8, 8),
+                    ResourceSpec::with_samples("post", 8, 8, 4),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([1.0, 1.0, 1.0, 1.0])),
+                    "pattern" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 4.0, 8.0],
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                            tint: [0.5, 0.5, 0.5, 1.0],
+                        }],
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    "blur" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let frames =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("execute");
+                let dark = linear_to_srgb8(0.5);
+                for (index, chunk) in frames[2].1.pixels.chunks_exact(4).enumerate() {
+                    let byte = tent_half_split((index % 8) as i32, dark, 255);
+                    assert_blurred_chunk(chunk, [byte, byte, byte, 255], 1);
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_parallel_matches_sequential() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                // 'paint' fills "white" (wave 1), 'pattern' splits it
+                // (wave 2), and the two blurs — horizontal and vertical —
+                // run side by side in wave 3.
+                let graph = &graph(&[
+                    node("paint", &[], &["white"]),
+                    node("pattern", &["white"], &["pattern"]),
+                    node("hblur", &["pattern"], &["a"]),
+                    node("vblur", &["pattern"], &["b"]),
+                ]);
+                let resources = [
+                    ResourceSpec::new("white", 8, 8),
+                    ResourceSpec::new("pattern", 8, 8),
+                    ResourceSpec::new("a", 8, 8),
+                    ResourceSpec::new("b", 8, 8),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([1.0, 1.0, 1.0, 1.0])),
+                    "pattern" => Some(PassKind::Sprites2d {
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 4.0, 4.0],
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                            tint: [0.5, 0.5, 0.5, 1.0],
+                        }],
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    "hblur" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    "vblur" => Some(PassKind::Blur {
+                        direction: [0.0, 1.0],
+                        background: [1.0, 1.0, 1.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let sequential =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect("sequential");
+                let parallel = execute_offscreen_parallel(&renderer, graph, &resources, &kinds, 2)
+                    .expect("parallel");
+                for ((s_name, s_frame), (p_name, p_frame)) in sequential.iter().zip(&parallel) {
+                    assert_eq!(s_name, p_name);
+                    assert_eq!(s_frame.pixels, p_frame.pixels, "target '{s_name}'");
+                }
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_rejects_multisampled_source() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let graph = &graph(&[
+                    node("paint", &[], &["scene"]),
+                    node("blur", &["scene"], &["post"]),
+                ]);
+                let resources = [
+                    ResourceSpec::with_samples("scene", 16, 16, 4),
+                    ResourceSpec::new("post", 16, 16),
+                ];
+                let kinds = |name: &str| match name {
+                    "paint" => Some(PassKind::Clear([0.5, 0.5, 0.5, 1.0])),
+                    "blur" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
+                        background: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                    _ => None,
+                };
+                let error =
+                    execute_offscreen(&renderer, graph, &resources, &kinds).expect_err("msaa");
+                assert!(
+                    error.to_string().contains("single-sample"),
+                    "source error must explain the constraint: {error}"
+                );
+            }
+            Err(RenderError::NoAdapter { .. }) => {}
+            Err(other) => panic!("unexpected renderer error: {other}"),
+        }
+    }
+
+    #[test]
+    fn blur_rejects_invalid_directions_and_read_counts() {
+        match Renderer::try_new(&RendererConfig::default()) {
+            Ok(renderer) => {
+                let param_graph = &graph(&[node("hpass", &["scene"], &["post"])]);
+                let resources = [
+                    ResourceSpec::new("scene", 8, 8),
+                    ResourceSpec::new("post", 8, 8),
+                ];
+                let zero = post::validate_blur_params("hpass", [0.0, 0.0]).expect_err("zero");
+                assert!(zero.to_string().contains("must move"), "{zero}");
+                for direction in [[f64::NAN, 0.0], [8.5, 0.0], [0.0, -9.0]] {
+                    let kinds = move |name: &str| match name {
+                        "hpass" => Some(PassKind::Blur {
+                            direction,
+                            background: [0.0, 0.0, 0.0, 1.0],
+                        }),
+                        _ => None,
+                    };
+                    let error = execute_offscreen(&renderer, param_graph, &resources, &kinds)
+                        .expect_err("range");
+                    assert!(
+                        error.to_string().contains("[-8, 8]"),
+                        "range error must explain the constraint: {error}"
+                    );
+                }
+                // Blur reads exactly one resource.
+                let reads_graph = &graph(&[node("hpass", &[], &["post"])]);
+                let kinds = |name: &str| match name {
+                    "hpass" => Some(PassKind::Blur {
+                        direction: [1.0, 0.0],
                         background: [0.0, 0.0, 0.0, 1.0],
                     }),
                     _ => None,
