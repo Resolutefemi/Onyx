@@ -834,19 +834,27 @@ fn encode_pass(
             // items), the texture from the declared read resource. Sprites
             // draw in submission order — later sprites overwrite earlier
             // ones (no blending in this increment).
-            let camera = sprite::Camera2d::new(target.width, target.height);
-            let camera_buffer = sprite::CameraUniformBuffer::new(renderer, &camera);
-            let read_index = pass.read_index.expect("Sprites2d plans a read");
-            let source_view = &targets[read_index].view;
-            let bind_group = sprite::create_sprite_bind_group(
-                renderer,
-                &context.sprite_layout,
-                &camera_buffer,
-                source_view,
-                &context.sampler,
-            );
             let vertices = sprite::sprite_vertices(sprites);
-            let vertex_buffer = sprite::SpriteVertexBuffer::new(renderer, &vertices);
+            // An empty batch renders the background clear only — wgpu
+            // rejects zero-sized buffers, so the batch resources are
+            // skipped entirely.
+            let batch = if vertices.is_empty() {
+                None
+            } else {
+                let camera = sprite::Camera2d::new(target.width, target.height);
+                let camera_buffer = sprite::CameraUniformBuffer::new(renderer, &camera);
+                let read_index = pass.read_index.expect("Sprites2d plans a read");
+                let source_view = &targets[read_index].view;
+                let bind_group = sprite::create_sprite_bind_group(
+                    renderer,
+                    &context.sprite_layout,
+                    &camera_buffer,
+                    source_view,
+                    &context.sampler,
+                );
+                let vertex_buffer = sprite::SpriteVertexBuffer::new(renderer, &vertices);
+                Some((bind_group, vertex_buffer))
+            };
             let attachment = wgpu::RenderPassColorAttachment {
                 view: attachment_view,
                 depth_slice: None,
@@ -866,10 +874,12 @@ fn encode_pass(
                 color_attachments: &[Some(attachment)],
                 ..wgpu::RenderPassDescriptor::default()
             });
-            pass_handle.set_pipeline(context.sprite_pipeline(target.samples, target.format));
-            pass_handle.set_bind_group(0, &bind_group, &[]);
-            pass_handle.set_vertex_buffer(0, vertex_buffer.buffer().slice(..));
-            pass_handle.draw(0..vertices.len() as u32, 0..1);
+            if let Some((bind_group, vertex_buffer)) = batch {
+                pass_handle.set_pipeline(context.sprite_pipeline(target.samples, target.format));
+                pass_handle.set_bind_group(0, &bind_group, &[]);
+                pass_handle.set_vertex_buffer(0, vertex_buffer.buffer().slice(..));
+                pass_handle.draw(0..vertices.len() as u32, 0..1);
+            }
         }
     }
 }
@@ -2552,7 +2562,11 @@ mod tests {
                 let kinds = |name: &str| match name {
                     "paint" => Some(PassKind::Clear(solid)),
                     "sprites" => Some(PassKind::Sprites2d {
-                        sprites: vec![sprite::Sprite2d::full_viewport(8.0, 8.0)],
+                        sprites: vec![sprite::Sprite2d {
+                            rect: [0.0, 0.0, 8.0, 8.0],
+                            uv: [0.0, 0.0, 1.0, 1.0],
+                            tint,
+                        }],
                         background: [0.0, 0.0, 0.0, 1.0],
                     }),
                     _ => None,
