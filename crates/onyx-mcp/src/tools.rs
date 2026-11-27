@@ -73,7 +73,7 @@ impl ToolRegistry {
         for command in commands {
             if result.aborted {
                 result.rejected += 1;
-            } else if self.get(command.tool).is_some() {
+            } else if self.get(&command.tool).is_some() {
                 result.applied += 1;
             } else {
                 result.rejected += 1;
@@ -90,7 +90,7 @@ impl ToolRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchCommand {
     /// Target tool id; must exist in the [`ToolRegistry`].
-    pub tool: &'static str,
+    pub tool: String,
     /// JSON-encoded arguments, matching the tool's `input_schema`.
     pub args_json: String,
 }
@@ -152,15 +152,15 @@ mod tests {
 
         let commands = vec![
             BatchCommand {
-                tool: "spawn_entity",
+                tool: "spawn_entity".to_owned(),
                 args_json: "{}".to_owned(),
             },
             BatchCommand {
-                tool: "spawn_entity",
+                tool: "spawn_entity".to_owned(),
                 args_json: "{}".to_owned(),
             },
             BatchCommand {
-                tool: "unknown_tool",
+                tool: "unknown_tool".to_owned(),
                 args_json: "{}".to_owned(),
             },
         ];
